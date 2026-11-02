@@ -84,6 +84,39 @@ async def test_interleaved_empty_chunks_are_skipped():
     assert "".join(out) == "ab"
 
 
+async def test_anthropic_stream_omits_unsupported_temperature_parameter():
+    svc = _svc()
+    svc.provider = "anthropic"
+
+    class Messages:
+        def stream(self, **kwargs):
+            self.last_kwargs = kwargs
+            return _AnthropicStreamContext(["Hello", " world"])
+
+    svc.client = type("Client", (), {"messages": Messages()})()
+
+    out = [t async for t in svc._stream_anthropic([{"role": "user", "content": "hi"}])]
+
+    assert "".join(out) == "Hello world"
+    assert "temperature" not in svc.client.messages.last_kwargs
+
+
+class _AnthropicStreamContext:
+    def __init__(self, chunks):
+        self.chunks = chunks
+        self.text_stream = self._text_stream()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_exc):
+        return False
+
+    async def _text_stream(self):
+        for chunk in self.chunks:
+            yield chunk
+
+
 async def test_response_with_no_choices_raises_a_typed_error():
     """A choice-less non-streaming response must be an LLMError, not IndexError."""
     svc = _svc()

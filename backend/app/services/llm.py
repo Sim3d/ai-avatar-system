@@ -2,7 +2,7 @@
 LLM facade for the chat pipeline.
 
 Provider-agnostic interface that currently supports Anthropic (default) and
-OpenAI. The Anthropic path takes advantage of:
+OpenAI (including Azure OpenAI). The Anthropic path takes advantage of:
 
   * **Prompt caching** — the system prompt is wrapped in a content block
     with `cache_control={"type": "ephemeral"}`. Cached reads cost ~10% of
@@ -26,6 +26,7 @@ from typing import AsyncGenerator, Dict, List, Optional
 
 import anthropic
 import openai
+from azure.core.exceptions import ClientAuthenticationError
 
 from app.config import settings
 
@@ -88,7 +89,9 @@ def _map_anthropic_exception(exc: Exception) -> LLMError:
 def _map_openai_exception(exc: Exception) -> LLMError:
     if isinstance(exc, openai.RateLimitError):
         return LLMRateLimited(str(exc))
-    if isinstance(exc, (openai.AuthenticationError, openai.PermissionDeniedError)):
+    if isinstance(
+        exc, (openai.AuthenticationError, openai.PermissionDeniedError, ClientAuthenticationError)
+    ):
         return LLMAuthError(str(exc))
     if isinstance(
         exc, (openai.APITimeoutError, openai.APIConnectionError, openai.InternalServerError)
@@ -109,9 +112,33 @@ class LLMService:
         # Ollama cloud glm-*:cloud / kimi-*:cloud). "none" disables reasoning
         # so they return normal `content`. Empty → not sent (default behavior).
         self.reasoning_effort = settings.LLM_REASONING_EFFORT or None
+        self._azure_credential = None
 
         if self.provider == "anthropic":
             self.client = anthropic.AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
+        elif self.provider == "azure_openai":
+            from azure.identity.aio import DefaultAzureCredential, get_bearer_token_provider
+
+            self.model = settings.AZURE_OPENAI_DEPLOYMENT
+            token_provider = None
+            if settings.AZURE_OPENAI_AUTH == "entra":
+                self._azure_credential = DefaultAzureCredential(
+                    managed_identity_client_id=settings.AZURE_MANAGED_IDENTITY_CLIENT_ID or None,
+                )
+                token_provider = get_bearer_token_provider(
+                    self._azure_credential, "https://cognitiveservices.azure.com/.default"
+                )
+            self.client = openai.AsyncAzureOpenAI(
+                azure_endpoint=settings.AZURE_OPENAI_ENDPOINT,
+                api_version=settings.AZURE_OPENAI_API_VERSION,
+                api_key=(
+                    settings.AZURE_OPENAI_API_KEY
+                    if settings.AZURE_OPENAI_AUTH == "api_key"
+                    else None
+                ),
+                azure_ad_token_provider=token_provider,
+            )
+            self.provider = "openai"
         elif self.provider == "ollama":
             # Ollama (and vLLM / LM Studio / OpenRouter) speak the OpenAI
             # wire protocol — reuse the OpenAI client against their base URL.
@@ -136,8 +163,15 @@ class LLMService:
             # wrong thing entirely.
             raise LLMError(
                 f"Unsupported LLM_PROVIDER {self.provider!r}. "
-                f"Expected one of: anthropic, openai, ollama."
+                f"Expected one of: anthropic, openai, ollama, azure_openai."
             )
+
+    async def close(self) -> None:
+        try:
+            await self.client.close()
+        finally:
+            if self._azure_credential is not None:
+                await self._azure_credential.close()
 
     # ── non-streaming ────────────────────────────────────────────────────────
 
@@ -255,7 +289,6 @@ class LLMService:
             async with self.client.messages.stream(
                 model=self.model,
                 max_tokens=self.max_tokens,
-                temperature=self.temperature,
                 system=_cacheable_system(system_prompt),
                 messages=messages,
             ) as stream:

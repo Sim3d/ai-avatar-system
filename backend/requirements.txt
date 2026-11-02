@@ -50,6 +50,8 @@ python-socketio==5.16.2
 # and the cache_control parameter used in app/services/llm.py
 anthropic>=0.45.0
 openai>=1.50.0
+azure-identity>=1.19.0,<2
+aiohttp>=3.9.0,<4  # Async transport for Azure identity
 torch==2.2.0
 torchvision==0.17.0
 torchaudio==2.2.0

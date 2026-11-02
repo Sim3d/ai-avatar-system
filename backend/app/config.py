@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import List, Literal, Optional, Union
 
 from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings
@@ -46,13 +46,21 @@ class Settings(BaseSettings):
     # Used when LLM_PROVIDER is "openai" or "ollama".
     OPENAI_BASE_URL: Optional[str] = None
 
+    # Azure uses a resource endpoint and deployment name, not a public model ID.
+    AZURE_OPENAI_ENDPOINT: str = ""
+    AZURE_OPENAI_DEPLOYMENT: str = ""
+    AZURE_OPENAI_API_VERSION: str = "2024-10-21"
+    AZURE_OPENAI_AUTH: Literal["entra", "api_key"] = "entra"
+    AZURE_OPENAI_API_KEY: str = ""
+    AZURE_MANAGED_IDENTITY_CLIENT_ID: Optional[str] = None
+
     # LLM Configuration
     # Anthropic models (2026): claude-opus-4-7 (most capable), claude-sonnet-4-6
     # (balanced — current default), claude-haiku-4-5 (fastest). OpenAI users
     # should override LLM_MODEL via .env (e.g. gpt-4o, gpt-4o-mini).
     # "ollama" runs fully local & free: set LLM_MODEL to e.g. llama3.1 and
     # optionally OPENAI_BASE_URL (defaults to http://localhost:11434/v1).
-    LLM_PROVIDER: str = "anthropic"  # anthropic, openai, ollama
+    LLM_PROVIDER: str = "anthropic"  # anthropic, openai, ollama, azure_openai
     LLM_MODEL: str = "claude-sonnet-4-6"
     LLM_TEMPERATURE: float = 0.7
     LLM_MAX_TOKENS: int = 2000
@@ -247,6 +255,31 @@ class Settings(BaseSettings):
             problems.append("CORS_ORIGINS must use https:// in production")
         if problems:
             raise ValueError("Unsafe production configuration:\n  - " + "\n  - ".join(problems))
+        return self
+
+    @model_validator(mode="after")
+    def _validate_azure_openai(self) -> "Settings":
+        if self.LLM_PROVIDER != "azure_openai":
+            return self
+        from urllib.parse import urlsplit
+
+        endpoint = urlsplit(self.AZURE_OPENAI_ENDPOINT)
+        if (
+            endpoint.scheme != "https"
+            or not endpoint.hostname
+            or endpoint.username
+            or endpoint.password
+            or endpoint.path not in ("", "/")
+            or endpoint.query
+            or endpoint.fragment
+        ):
+            raise ValueError("AZURE_OPENAI_ENDPOINT must be an HTTPS resource root URL")
+        if not self.AZURE_OPENAI_DEPLOYMENT.strip():
+            raise ValueError("AZURE_OPENAI_DEPLOYMENT is required for azure_openai")
+        if not self.AZURE_OPENAI_API_VERSION.strip():
+            raise ValueError("AZURE_OPENAI_API_VERSION is required for azure_openai")
+        if self.AZURE_OPENAI_AUTH == "api_key" and not self.AZURE_OPENAI_API_KEY.strip():
+            raise ValueError("AZURE_OPENAI_API_KEY is required for api_key authentication")
         return self
 
     @model_validator(mode="after")

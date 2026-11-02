@@ -19,6 +19,7 @@ from app.middleware.rate_limiter import RateLimitMiddleware
 from app.middleware.security import RequestLoggingMiddleware, SecurityHeadersMiddleware
 from app.models import Session as SessionModel
 from app.services.cache import cache_service
+from app.services.llm import llm_service
 from app.services.storage import storage_service
 from app.telemetry import init_telemetry
 from app.tokens import subject_from_token
@@ -93,6 +94,7 @@ async def lifespan(app: FastAPI):
     # Cleanup
     logger.info("Shutting down AI Avatar System...")
     await websocket_manager.stop_cleanup_task()
+    await llm_service.close()
     await storage_service.cleanup()
     await cache_service.cleanup()
     logger.info("Shutdown complete")

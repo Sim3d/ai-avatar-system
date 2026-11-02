@@ -177,7 +177,7 @@ ai-avatar-system/
 ├── scripts/
 │   ├── setup_musetalk.sh       # Download MuseTalk models (~9 GB)
 │   └── deploy-aws.sh           # One-command EC2 GPU deployment
-├── docker-compose.yml          # Development (CPU) — all services
+├── docker-compose.yml          # Local development stack
 ├── docker-compose.prod.yml     # Production overrides (GPU, no bind mounts, logging)
 ├── deploy.sh                   # ECR push + Terraform deploy (ECS path)
 ├── .env.example                # Development env template
@@ -193,14 +193,18 @@ ai-avatar-system/
 - **Docker & Docker Compose** v2+ (recommended)
 - OR: Python 3.10+, Node.js 18+, FFmpeg, PostgreSQL, Redis
 
-### Option A — Docker / CPU (development)
+### Option A — Docker (development)
 
 ```bash
 git clone https://github.com/PunithVT/ai-avatar-system.git
 cd ai-avatar-system
 cp .env.example .env          # add your ANTHROPIC_API_KEY (or OPENAI_API_KEY)
+# Set distinct random values for SECRET_KEY and JWT_SECRET_KEY in .env.
+# Generate each value with: python -c "import secrets; print(secrets.token_hex(32))"
 docker compose up -d
 ```
+
+The frontend and API are available directly on ports 3000 and 8000. Nginx is optional; enable it with `docker compose --profile proxy up -d nginx` when ports 80 and 443 are available.
 
 | Service | URL |
 |---|---|
@@ -319,6 +323,48 @@ print('VRAM:', round(torch.cuda.get_device_properties(0).total_memory/1024**3,1)
 # Live GPU utilisation
 docker exec avatar-backend nvidia-smi
 ```
+
+### Azure OpenAI (company subscription)
+
+The backend supports Azure OpenAI without a personal API key. This only changes
+the LLM provider; it does not deploy the GPU, database, or storage to Azure.
+See [the Azure migration plan](PLAN-MIGRATION-AZURE.md) for the remaining work.
+
+Configure `.env` (or `.env.prod` for production):
+
+```dotenv
+LLM_PROVIDER=azure_openai
+AZURE_OPENAI_ENDPOINT=https://YOUR-RESOURCE.openai.azure.com
+AZURE_OPENAI_DEPLOYMENT=YOUR-DEPLOYMENT-NAME
+AZURE_OPENAI_API_VERSION=2024-10-21
+AZURE_OPENAI_AUTH=entra
+```
+
+`AZURE_OPENAI_DEPLOYMENT` is the Azure deployment name, not `LLM_MODEL`. Start
+with a `gpt-4o-mini` deployment: the current pipeline sends `temperature` and
+`max_tokens`, which are not supported by every reasoning model. Both standard
+responses and streaming use the Azure deployment.
+
+For local development, sign in with `az login` using an authorized company
+account. In Azure, enable a managed identity on the backend host. Grant the
+account or managed identity **Cognitive Services OpenAI User** on the Azure
+OpenAI resource. For a user-assigned managed identity, also set
+`AZURE_MANAGED_IDENTITY_CLIENT_ID`. The async default credential chain acquires
+and refreshes tokens when requests are made; startup alone does not verify access.
+Never put Azure credentials in `NEXT_PUBLIC_*` variables or the frontend.
+
+If company policy requires resource keys instead, set
+`AZURE_OPENAI_AUTH=api_key` and `AZURE_OPENAI_API_KEY` on the backend only.
+Keep that value in a secret store, not source control. Global Standard deployment
+type and data residency are configured in Azure, not by these environment variables.
+Claude through Foundry is not implemented by this provider.
+
+Offline contract tests can run without the GPU, API fixtures, or Azure access:
+from `backend`, run `python -m unittest discover -s tests -p test_azure_llm.py`.
+Supply the normal application secret settings and a dummy key for the default
+Anthropic provider if needed at module import. Tests mock all inference calls.
+Real RBAC, network access, model availability, and GPU latency still require
+validation once Azure access is granted.
 
 ### AWS Terraform (ECS Path)
 
