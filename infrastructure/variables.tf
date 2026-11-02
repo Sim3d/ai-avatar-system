@@ -106,6 +106,18 @@ variable "openai_api_key" {
   sensitive = true
 }
 
+variable "llm_provider" {
+  description = "LLM provider for the backend. 'bedrock' uses Claude through Amazon Bedrock with the task IAM role (no API key)."
+  type        = string
+  default     = "bedrock"
+}
+
+variable "llm_model" {
+  description = "Model ID. For bedrock, a Bedrock model or inference-profile ID."
+  type        = string
+  default     = "global.anthropic.claude-sonnet-4-6"
+}
+
 variable "jwt_secret_key" {
   description = "Must be >= 32 chars; Settings refuses to start otherwise."
   type        = string

@@ -1,8 +1,9 @@
 """
 LLM facade for the chat pipeline.
 
-Provider-agnostic interface that currently supports Anthropic (default) and
-OpenAI (including Azure OpenAI). The Anthropic path takes advantage of:
+Provider-agnostic interface that currently supports Anthropic (default),
+Amazon Bedrock (Claude via IAM role, no API key) and OpenAI (including
+Azure OpenAI). The Anthropic path takes advantage of:
 
   * **Prompt caching** — the system prompt is wrapped in a content block
     with `cache_control={"type": "ephemeral"}`. Cached reads cost ~10% of
@@ -116,6 +117,17 @@ class LLMService:
 
         if self.provider == "anthropic":
             self.client = anthropic.AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
+        elif self.provider == "bedrock":
+            # Claude via Amazon Bedrock. Credentials come from the standard AWS
+            # chain (ECS task role in production) — no API key to manage. The
+            # Bedrock client exposes the same messages API, so downstream code
+            # paths are identical to the direct Anthropic path.
+            self.client = anthropic.AsyncAnthropicBedrock(aws_region=settings.AWS_REGION)
+            self.provider = "anthropic"
+            logger.info(
+                f"LLM provider 'bedrock' → Anthropic Bedrock client "
+                f"(region={settings.AWS_REGION}, model={self.model})"
+            )
         elif self.provider == "azure_openai":
             from azure.identity.aio import DefaultAzureCredential, get_bearer_token_provider
 
@@ -163,7 +175,7 @@ class LLMService:
             # wrong thing entirely.
             raise LLMError(
                 f"Unsupported LLM_PROVIDER {self.provider!r}. "
-                f"Expected one of: anthropic, openai, ollama, azure_openai."
+                f"Expected one of: anthropic, bedrock, openai, ollama, azure_openai."
             )
 
     async def close(self) -> None:

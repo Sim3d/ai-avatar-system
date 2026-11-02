@@ -60,7 +60,10 @@ class Settings(BaseSettings):
     # should override LLM_MODEL via .env (e.g. gpt-4o, gpt-4o-mini).
     # "ollama" runs fully local & free: set LLM_MODEL to e.g. llama3.1 and
     # optionally OPENAI_BASE_URL (defaults to http://localhost:11434/v1).
-    LLM_PROVIDER: str = "anthropic"  # anthropic, openai, ollama, azure_openai
+    # "bedrock" calls Claude through Amazon Bedrock using the task/instance IAM
+    # role — no API key. Set LLM_MODEL to a Bedrock model or inference-profile
+    # ID (e.g. global.anthropic.claude-sonnet-4-5-20250929-v1:0).
+    LLM_PROVIDER: str = "anthropic"  # anthropic, bedrock, openai, ollama, azure_openai
     LLM_MODEL: str = "claude-sonnet-4-6"
     LLM_TEMPERATURE: float = 0.7
     LLM_MAX_TOKENS: int = 2000

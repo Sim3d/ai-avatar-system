@@ -118,6 +118,28 @@ resource "aws_iam_role_policy" "task_s3" {
   policy = data.aws_iam_policy_document.task_s3.json
 }
 
+# Claude via Amazon Bedrock — the app authenticates with this task role, so no
+# LLM API key is stored anywhere. Covers foundation models and the regional /
+# global inference profiles (us.anthropic.*, global.anthropic.*).
+data "aws_iam_policy_document" "task_bedrock" {
+  statement {
+    actions = [
+      "bedrock:InvokeModel",
+      "bedrock:InvokeModelWithResponseStream",
+    ]
+    resources = [
+      "arn:aws:bedrock:*::foundation-model/anthropic.*",
+      "arn:aws:bedrock:*:*:inference-profile/*.anthropic.*",
+    ]
+  }
+}
+
+resource "aws_iam_role_policy" "task_bedrock" {
+  name   = "${local.name}-bedrock"
+  role   = aws_iam_role.task.id
+  policy = data.aws_iam_policy_document.task_bedrock.json
+}
+
 # EC2 instances that join the cluster.
 data "aws_iam_policy_document" "ec2_assume" {
   statement {
@@ -319,6 +341,9 @@ locals {
     { name = "CORS_ORIGINS", value = var.cors_origins != "" ? var.cors_origins : "https://${aws_lb.main.dns_name}" },
     { name = "FRONTEND_URL", value = "https://${aws_lb.main.dns_name}" },
     { name = "BACKEND_URL", value = "https://${aws_lb.main.dns_name}" },
+    # LLM via Amazon Bedrock: authenticated by the task IAM role, no API key.
+    { name = "LLM_PROVIDER", value = var.llm_provider },
+    { name = "LLM_MODEL", value = var.llm_model },
   ]
 
   backend_secrets = concat(
