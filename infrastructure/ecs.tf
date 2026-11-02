@@ -28,16 +28,29 @@ resource "aws_ssm_parameter" "db_password" {
   value = random_password.db_password.result
 }
 
+# Auto-generated when the variables are left empty, so no secret ever needs to
+# be passed on the command line or shared between operators — it lives only in
+# the (encrypted, remote) state and in SSM.
+resource "random_password" "jwt_secret_key" {
+  length  = 64
+  special = false
+}
+
+resource "random_password" "secret_key" {
+  length  = 64
+  special = false
+}
+
 resource "aws_ssm_parameter" "jwt_secret_key" {
   name  = "/${local.name}/JWT_SECRET_KEY"
   type  = "SecureString"
-  value = var.jwt_secret_key
+  value = var.jwt_secret_key != "" ? var.jwt_secret_key : random_password.jwt_secret_key.result
 }
 
 resource "aws_ssm_parameter" "secret_key" {
   name  = "/${local.name}/SECRET_KEY"
   type  = "SecureString"
-  value = var.secret_key
+  value = var.secret_key != "" ? var.secret_key : random_password.secret_key.result
 }
 
 resource "aws_ssm_parameter" "anthropic_api_key" {

@@ -9,21 +9,16 @@ terraform {
     }
   }
 
-  # Remote state is commented out because the bucket and lock table below are
-  # not created by this configuration — `terraform init` against them fails
-  # before anything can be provisioned, which is a poor first experience. Local
-  # state is fine for a single operator.
-  #
-  # For a team, create the bucket and table first (they must pre-exist), then
-  # uncomment and re-run `terraform init -migrate-state`:
-  #
-  # backend "s3" {
-  #   bucket         = "avatar-chatbot-terraform-state"
-  #   key            = "terraform.tfstate"
-  #   region         = "us-east-1"
-  #   encrypt        = true
-  #   dynamodb_table = "terraform-lock"
-  # }
+  # Remote state shared between operators (IAM applies are run by a platform
+  # admin). The bucket pre-exists in PIMTRACK-DEV; locking uses the S3-native
+  # lockfile (Terraform >= 1.11), no DynamoDB table needed.
+  backend "s3" {
+    bucket       = "avatar-hackathon-2026-135131586303"
+    key          = "terraform/avatar-dev.tfstate"
+    region       = "us-east-1"
+    encrypt      = true
+    use_lockfile = true
+  }
 }
 
 provider "aws" {
@@ -56,7 +51,7 @@ module "vpc" {
   public_subnets  = ["10.0.101.0/24", "10.0.102.0/24", "10.0.103.0/24"]
 
   enable_nat_gateway   = true
-  single_nat_gateway   = true # POC: 1 NAT gateway (1 EIP) au lieu de 3, ~65$/mois d'économie
+  single_nat_gateway   = true # POC: 1 NAT gateway (1 EIP) instead of 3, saves ~$65/month
   enable_dns_hostnames = true
   enable_dns_support   = true
 
@@ -187,8 +182,9 @@ resource "aws_db_subnet_group" "main" {
 }
 
 resource "random_password" "db_password" {
-  length  = 32
-  special = true
+  length           = 32
+  special          = true
+  override_special = "!#$%&*()-_=+[]{}<>:?"
 }
 
 # ElastiCache Redis
