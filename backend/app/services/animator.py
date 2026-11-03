@@ -6,6 +6,7 @@ import os
 import sys
 import tempfile
 import uuid
+import wave
 from pathlib import Path
 from typing import Optional
 
@@ -45,6 +46,7 @@ class AvatarAnimator:
         self._worker_lock = asyncio.Lock()
         self._worker_env: dict = {}
         self._worker_stderr_path: Optional[Path] = None
+        self._warmed_avatars: set[str] = set()
 
         if self.device == "cuda":
             gpu_name = torch.cuda.get_device_name(0)
@@ -206,6 +208,45 @@ class AvatarAnimator:
             raise
         except Exception as e:
             logger.warning(f"MuseTalk prewarm failed (will start lazily): {e}")
+
+    async def warm_avatar(self, avatar_path: str) -> None:
+        """
+        Animate a throwaway clip of silence for this avatar.
+
+        The first clip of an avatar pays face detection and first-call CUDA
+        costs (~19s on the A10G); doing it at session connect keeps that off
+        the first reply. Never raises.
+        """
+        key = str(Path(avatar_path).resolve())
+        if key in self._warmed_avatars:
+            return
+        try:
+            if not self._initialised:
+                await self.initialize()
+            if self.engine != "musetalk" or not self._musetalk_weights_ready():
+                return
+            fd, audio = tempfile.mkstemp(suffix="_warm.wav")
+            os.close(fd)
+            video = audio.replace("_warm.wav", "_warm.mp4")
+            try:
+                with wave.open(audio, "wb") as w:
+                    w.setnchannels(1)
+                    w.setsampwidth(2)
+                    w.setframerate(16000)
+                    w.writeframes(b"\x00\x00" * 8000)  # 0.5 s
+                t0 = asyncio.get_running_loop().time()
+                await self._animate_musetalk(avatar_path, audio, video)
+                self._warmed_avatars.add(key)
+                logger.info(
+                    "Avatar warmed in %.1fs: %s", asyncio.get_running_loop().time() - t0, avatar_path
+                )
+            finally:
+                Path(audio).unlink(missing_ok=True)
+                Path(video).unlink(missing_ok=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"Avatar warm-up failed (first turn will be slower): {e}")
 
     async def _ensure_worker(self) -> asyncio.subprocess.Process:
         """Start the persistent worker if not already running."""

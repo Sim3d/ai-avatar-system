@@ -86,24 +86,29 @@ foreach ($svc in $images) {
 # Services may not exist yet (IAM roles pending) — skip them gracefully.
 # Backend first: it is the slowest to start and must win the scarce ENIs on
 # the single GPU instance.
-$services = @("backend", "frontend", "worker") | Where-Object { $_ -in $Services } | ForEach-Object { "avatar-$_" }
-$existing = (Invoke-Aws ecs describe-services --cluster $Cluster --services @services --output json | ConvertFrom-Json).services |
+$ecsServices = @("backend", "frontend", "worker") | Where-Object { $_ -in $Services } | ForEach-Object { "avatar-$_" }
+$existing = (Invoke-Aws ecs describe-services --cluster $Cluster --services @ecsServices --output json | ConvertFrom-Json).services |
     Where-Object { $_.status -eq "ACTIVE" } | ForEach-Object { $_.serviceName }
-$missing = $services | Where-Object { $_ -notin $existing }
+$missing = $ecsServices | Where-Object { $_ -notin $existing }
 if ($missing) {
     Write-Host "==> Skipping missing services (not created yet): $($missing -join ', ')" -ForegroundColor Yellow
 }
-$services = @($existing)
-foreach ($svc in $services) {
-    Write-Host "==> Rolling $svc..." -ForegroundColor Cyan
-    Invoke-Aws ecs update-service --cluster $Cluster --service $svc --force-new-deployment --output text --query "service.serviceName" | Out-Null
+$ecsServices = @($existing)
+foreach ($svc in $ecsServices) {
+    # Roll to the family's latest ACTIVE revision, not the service's current
+    # one: env/resource changes from `terraform apply` land as new revisions,
+    # and the services ignore task_definition in Terraform.
+    $currentTd = Invoke-Aws ecs describe-services --cluster $Cluster --services $svc --output text --query "services[0].taskDefinition"
+    $family = ($currentTd.Trim() -split "/")[-1] -replace ":\d+$", ""
+    Write-Host "==> Rolling $svc (task definition $family, latest revision)..." -ForegroundColor Cyan
+    Invoke-Aws ecs update-service --cluster $Cluster --service $svc --task-definition $family --force-new-deployment --output text --query "service.serviceName" | Out-Null
 }
 
-if (-not $services) {
+if (-not $ecsServices) {
     Write-Host "==> Images pushed. No ECS services to roll yet." -ForegroundColor Green
 } elseif ($SkipWait) {
     Write-Host "==> Deployment triggered (wait skipped). Check status with:" -ForegroundColor Yellow
-    Write-Host "    aws ecs describe-services --cluster $Cluster --services $($services -join ' ')"
+    Write-Host "    aws ecs describe-services --cluster $Cluster --services $($ecsServices -join ' ')"
 } else {
     # `aws ecs wait services-stable` gives up after 10 min (exit 255), shorter
     # than a backend cold start, and hides placement errors. Poll instead.
@@ -111,7 +116,7 @@ if (-not $services) {
     $deadline = (Get-Date).AddMinutes($WaitMinutes)
     $lastEvent = @{}
     while ($true) {
-        $state = (Invoke-Aws ecs describe-services --cluster $Cluster --services @services --output json | ConvertFrom-Json).services
+        $state = (Invoke-Aws ecs describe-services --cluster $Cluster --services @ecsServices --output json | ConvertFrom-Json).services
         $pending = @()
         foreach ($s in $state) {
             $primary = $s.deployments | Where-Object { $_.status -eq "PRIMARY" }

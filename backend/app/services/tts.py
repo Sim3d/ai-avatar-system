@@ -21,7 +21,9 @@ notify the user when voice cloning was silently dropped during fallback.
 
 import asyncio
 import logging
+import os
 import re
+import tempfile
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
@@ -285,6 +287,23 @@ class TTSService:
                 fallback=True,
                 voice_cloned=False,
             )
+
+    async def warm_voice(self, speaker_wav: str) -> None:
+        """
+        Synthesize a throwaway word with this voice so the Chatterbox sidecar
+        caches its speaker conditionals before the first real sentence.
+        Never raises.
+        """
+        if not settings.CHATTERBOX_URL or not Path(speaker_wav).exists():
+            return
+        fd, out = tempfile.mkstemp(suffix="_warm.wav")
+        os.close(fd)
+        try:
+            await self._remote_chatterbox("Hi.", out, speaker_wav, "en")
+        except Exception as e:
+            logger.warning(f"Voice warm-up failed (first sentence will be slower): {e}")
+        finally:
+            Path(out).unlink(missing_ok=True)
 
     async def _remote_chatterbox(
         self,

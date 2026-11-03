@@ -192,6 +192,8 @@ class ConnectionManager:
         # barge-in: when a fresh user input arrives we cancel the in-flight
         # task instead of queueing.
         self._active_turns: Dict[str, asyncio.Task] = {}
+        # Strong refs to fire-and-forget warm-up tasks (asyncio keeps weak ones).
+        self._warm_tasks: set[asyncio.Task] = set()
         # Per-session send lock. The turn task streams chunks while the WS
         # receive loop may also send (pong/error) — without this, two
         # coroutines could interleave mid-frame and corrupt the connection.
@@ -232,7 +234,28 @@ class ConnectionManager:
             "last_activity": datetime.now(timezone.utc),
         }
         await self._load_session_data(session_id)
+        self._start_warmup(session_id)
         logger.info(f"WebSocket connected: {session_id} (user={user_id})")
+
+    def _start_warmup(self, session_id: str) -> None:
+        """
+        Pay the per-avatar and per-voice first-use costs while the user is
+        still typing, not on their first turn (~19s face prep, ~3s voice prep).
+        """
+        data = self.session_data[session_id]
+        image, wav = data.get("avatar_image_local"), data.get("voice_wav")
+        if not image and not wav:
+            return
+
+        async def _warm() -> None:
+            await asyncio.gather(
+                avatar_animator.warm_avatar(image) if image else asyncio.sleep(0),
+                tts_service.warm_voice(wav) if wav else asyncio.sleep(0),
+            )
+
+        task = asyncio.create_task(_warm(), name=f"warm-{session_id}")
+        self._warm_tasks.add(task)
+        task.add_done_callback(self._warm_tasks.discard)
 
     async def _roll_memory(self, session_id: str, dropped: list[dict]) -> None:
         """
