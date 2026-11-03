@@ -20,7 +20,7 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$Cluster = "avatar-cluster-production",
+    [string]$Cluster = "avatar-cluster-dev",
     [string]$ImageTag = "latest",
     [string]$Region = "us-east-1",
     # AWS CLI profile (leave empty to use the default profile / env credentials)
@@ -55,31 +55,41 @@ if ($LASTEXITCODE -ne 0) { throw "docker login failed" }
 # --- Build and push ----------------------------------------------------------
 $repoRoot = $PSScriptRoot
 foreach ($svc in @(
-    @{ Name = "avatar-backend";  Context = Join-Path $repoRoot "backend" },
-    @{ Name = "avatar-frontend"; Context = Join-Path $repoRoot "frontend" }
+    @{ Name = "avatar-backend";  Repo = "avatar/backend";  Context = Join-Path $repoRoot "backend" },
+    @{ Name = "avatar-frontend"; Repo = "avatar/frontend"; Context = Join-Path $repoRoot "frontend" }
 )) {
-    Write-Host "==> Building $($svc.Name):$ImageTag..." -ForegroundColor Cyan
-    docker build -t "$registry/$($svc.Name):$ImageTag" -t "$registry/$($svc.Name):latest" $svc.Context
+    Write-Host "==> Building $($svc.Repo):$ImageTag..." -ForegroundColor Cyan
+    docker build -t "$registry/$($svc.Repo):$ImageTag" -t "$registry/$($svc.Repo):latest" $svc.Context
     if ($LASTEXITCODE -ne 0) { throw "docker build $($svc.Name) failed" }
 
-    Write-Host "==> Pushing $($svc.Name)..." -ForegroundColor Cyan
-    docker push "$registry/$($svc.Name):$ImageTag"
-    if ($LASTEXITCODE -ne 0) { throw "docker push $($svc.Name):$ImageTag failed" }
+    Write-Host "==> Pushing $($svc.Repo)..." -ForegroundColor Cyan
+    docker push "$registry/$($svc.Repo):$ImageTag"
+    if ($LASTEXITCODE -ne 0) { throw "docker push $($svc.Repo):$ImageTag failed" }
     if ($ImageTag -ne "latest") {
-        docker push "$registry/$($svc.Name):latest"
-        if ($LASTEXITCODE -ne 0) { throw "docker push $($svc.Name):latest failed" }
+        docker push "$registry/$($svc.Repo):latest"
+        if ($LASTEXITCODE -ne 0) { throw "docker push $($svc.Repo):latest failed" }
     }
 }
 
 # --- Roll the ECS services ---------------------------------------------------
 # The worker runs the same backend image, so it is rolled too.
+# Services may not exist yet (IAM roles pending) — skip them gracefully.
 $services = @("avatar-backend", "avatar-frontend", "avatar-worker")
+$existing = (Invoke-Aws ecs describe-services --cluster $Cluster --services @services --output json | ConvertFrom-Json).services |
+    Where-Object { $_.status -eq "ACTIVE" } | ForEach-Object { $_.serviceName }
+$missing = $services | Where-Object { $_ -notin $existing }
+if ($missing) {
+    Write-Host "==> Skipping missing services (not created yet): $($missing -join ', ')" -ForegroundColor Yellow
+}
+$services = @($existing)
 foreach ($svc in $services) {
     Write-Host "==> Rolling $svc..." -ForegroundColor Cyan
     Invoke-Aws ecs update-service --cluster $Cluster --service $svc --force-new-deployment --output text --query "service.serviceName" | Out-Null
 }
 
-if ($SkipWait) {
+if (-not $services) {
+    Write-Host "==> Images pushed. No ECS services to roll yet." -ForegroundColor Green
+} elseif ($SkipWait) {
     Write-Host "==> Deployment triggered (wait skipped). Check status with:" -ForegroundColor Yellow
     Write-Host "    aws ecs describe-services --cluster $Cluster --services $($services -join ' ')"
 } else {

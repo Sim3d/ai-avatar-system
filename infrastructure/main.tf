@@ -82,10 +82,29 @@ resource "aws_s3_bucket_cors_configuration" "media" {
 
   cors_rule {
     allowed_headers = ["*"]
-    allowed_methods = ["GET", "HEAD"]
+    allowed_methods = ["GET", "HEAD", "PUT", "POST"]
     allowed_origins = ["*"]
+    expose_headers  = ["ETag"]
     max_age_seconds = 3000
   }
+}
+
+# Allow CloudFront (OAI) to read objects from the media bucket
+resource "aws_s3_bucket_policy" "media" {
+  bucket = aws_s3_bucket.media.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid       = "AllowCloudFrontOAIRead"
+        Effect    = "Allow"
+        Principal = { AWS = aws_cloudfront_origin_access_identity.media.iam_arn }
+        Action    = "s3:GetObject"
+        Resource  = "${aws_s3_bucket.media.arn}/*"
+      }
+    ]
+  })
 }
 
 # CloudFront distribution
@@ -147,7 +166,7 @@ resource "aws_db_instance" "postgres" {
   identifier = "${var.project_name}-db-${var.environment}"
 
   engine                = "postgres"
-  engine_version        = "15.19" # 15.4 n'est plus offerte par RDS
+  engine_version        = "15.19" # 15.4 is no longer offered by RDS
   instance_class        = var.environment == "production" ? "db.t3.medium" : "db.t3.micro"
   allocated_storage     = 20
   max_allocated_storage = 100
