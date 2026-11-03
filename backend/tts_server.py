@@ -49,6 +49,9 @@ _generate_lock = asyncio.Lock()
 _MAX_CACHED_SPEAKERS = 32
 _speaker_conds: "OrderedDict[str, object]" = OrderedDict()
 _default_conds = None
+# Chatterbox's default 0.8 sampling makes cloned voices stutter/repeat words;
+# a lower temperature keeps the voice but stabilises the token stream.
+_TEMPERATURE = float(os.getenv("TTS_TEMPERATURE", "0.6"))
 
 
 def _device() -> str:
@@ -121,7 +124,7 @@ def _use_speaker(key: Optional[str], data: Optional[bytes]) -> None:
 
 def _generate(text: str, language: str, key: Optional[str], data: Optional[bytes]):
     _use_speaker(key, data)
-    return _model.generate(text, language_id=language)
+    return _model.generate(text, language_id=language, temperature=_TEMPERATURE)
 
 
 @app.post("/synthesize")

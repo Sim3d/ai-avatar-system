@@ -33,11 +33,19 @@ from app.websocket import (
 
 def test_drain_chunks_emits_at_clause_for_first_fragment():
     """A clause boundary ships the opening fragment before the sentence ends."""
-    buf = "Sure thing, let me look that up for you right now."
+    buf = "Sure thing, let me look that up for you, it only takes a second."
     chunks, rest = _drain_chunks(buf, _CLAUSE_RE, _MIN_FIRST_CHUNK_LEN, _MAX_CHUNK_CHARS)
-    # "Sure thing," is >= 12 chars → emitted at the comma, not the period.
+    # "Sure thing," is too short and merges forward; the next comma ships it.
     assert chunks
-    assert chunks[0].startswith("Sure thing,")
+    assert chunks[0] == "Sure thing, let me look that up for you,"
+
+
+def test_drain_chunks_merges_short_greeting():
+    """A tiny opener isn't synthesized alone (Chatterbox loops on it)."""
+    buf = "Hi there! Great to meet you! How"
+    chunks, rest = _drain_chunks(buf, _CLAUSE_RE, _MIN_FIRST_CHUNK_LEN, _MAX_CHUNK_CHARS)
+    assert chunks == ["Hi there! Great to meet you!"]
+    assert rest == "How"
 
 
 def test_drain_chunks_never_drops_text():

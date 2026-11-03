@@ -73,8 +73,11 @@ def _write_private_bytes(path: Path, data: bytes) -> None:
 # colon/dash) once it's long enough, so audio+video start as early as
 # possible. Every chunk after that uses SENTENCE boundaries — fewer TTS
 # calls and smoother prosody for the bulk of the reply.
-_MIN_SENTENCE_LEN = 8
-_MIN_FIRST_CHUNK_LEN = 10  # ship the opening clause fast (~2 words)
+# Chatterbox loops on very short inputs (its repetition guard is disabled
+# under ~5 text tokens), repeating words or the whole fragment, so short
+# fragments like "Hi there!" merge into the next one instead.
+_MIN_SENTENCE_LEN = 20
+_MIN_FIRST_CHUNK_LEN = 20
 # Force-flush a run-on with no usable punctuation so we never stall waiting
 # for a boundary that may never come.
 _MAX_CHUNK_CHARS = 200
