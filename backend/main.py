@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -18,6 +19,7 @@ from app.logging_config import configure_logging
 from app.middleware.rate_limiter import RateLimitMiddleware
 from app.middleware.security import RequestLoggingMiddleware, SecurityHeadersMiddleware
 from app.models import Session as SessionModel
+from app.services.animator import avatar_animator
 from app.services.cache import cache_service
 from app.services.llm import llm_service
 from app.services.storage import storage_service
@@ -87,12 +89,15 @@ async def lifespan(app: FastAPI):
         logger.info(f"Serving local uploads from {uploads_dir}")
 
     websocket_manager.start_cleanup_task()
+    # Background: the first turn after a deploy must not pay model loading.
+    prewarm_task = asyncio.create_task(avatar_animator.prewarm())
     logger.info("AI Avatar System started successfully")
 
     yield
 
     # Cleanup
     logger.info("Shutting down AI Avatar System...")
+    prewarm_task.cancel()
     await websocket_manager.stop_cleanup_task()
     await llm_service.close()
     await storage_service.cleanup()

@@ -179,6 +179,34 @@ class AvatarAnimator:
 
     # ── persistent worker management ─────────────────────────────────────────
 
+    async def prewarm(self, weights_wait_s: float = 1800, poll_s: float = 15) -> None:
+        """
+        Load the MuseTalk worker ahead of the first turn.
+
+        The worker otherwise starts lazily, so the first user turn after a
+        deploy also paid ~60s of model loading. Weights may still be
+        downloading on first boot, so wait for them (bounded) before spawning.
+        Failures are logged only: the lazy path in _worker_infer still applies.
+        """
+        try:
+            if not self._initialised:
+                await self.initialize()
+            if self.engine != "musetalk" or self.device != "cuda":
+                return
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + weights_wait_s
+            while not self._musetalk_weights_ready():
+                if loop.time() >= deadline:
+                    logger.warning("MuseTalk prewarm skipped: weights still missing")
+                    return
+                await asyncio.sleep(poll_s)
+            async with self._worker_lock:
+                await self._ensure_worker()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"MuseTalk prewarm failed (will start lazily): {e}")
+
     async def _ensure_worker(self) -> asyncio.subprocess.Process:
         """Start the persistent worker if not already running."""
         if self._worker_proc is not None and self._worker_proc.returncode is None:
@@ -326,6 +354,12 @@ class AvatarAnimator:
                     logger.error(f"MuseTalk worker traceback:\n{result['tb']}")
                 raise RuntimeError(result.get("msg", "Unknown worker error"))
 
+            if result.get("timings"):
+                t = result["timings"]
+                logger.info(
+                    "MuseTalk job timings: prep=%.2fs unet=%.2fs blend_encode=%.2fs frames=%s",
+                    t.get("prep", 0), t.get("unet", 0), t.get("blend_encode", 0), t.get("frames"),
+                )
             return output_path
 
     # ── public API ────────────────────────────────────────────────────────────

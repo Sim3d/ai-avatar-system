@@ -393,8 +393,10 @@ locals {
     # volume so they aren't re-downloaded on every task start.
     { name = "TORCH_HOME", value = "/app/models/MuseTalk/models/.torch" },
     { name = "HF_HOME", value = "/app/models/MuseTalk/models/.hf" },
-    # GFPGAN pass on lip-synced frames: sharpens MuseTalk's 256px mouth region.
-    { name = "FACE_RESTORE", value = "gfpgan" },
+    # GFPGAN pass on lip-synced frames sharpens MuseTalk's 256px mouth region,
+    # but runs per frame and dominated chunk latency (~10-25s per sentence on
+    # an A10G). Off for responsiveness; set "gfpgan" to trade latency for detail.
+    { name = "FACE_RESTORE", value = "off" },
   ]
 
   backend_secrets = concat(

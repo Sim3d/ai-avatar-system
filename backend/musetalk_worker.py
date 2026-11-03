@@ -19,12 +19,12 @@ Lifecycle:
 All paths may be absolute or relative to cwd (the MuseTalk repo root).
 """
 
-import copy
 import json
 import os
 import pickle
-import shutil
+import subprocess
 import sys
+import time
 import traceback
 from typing import Any, List
 
@@ -39,7 +39,8 @@ import cv2
 import numpy as np
 import torch
 from musetalk.utils.audio_processor import AudioProcessor
-from musetalk.utils.blending import get_image
+from musetalk.utils.blending import face_seg, get_crop_box, get_image_blending
+from PIL import Image
 from musetalk.utils.face_parsing import FaceParsing
 from musetalk.utils.preprocessing import coord_placeholder, get_landmark_and_bbox, read_imgs
 from musetalk.utils.utils import datagen, load_all_model
@@ -127,11 +128,43 @@ def _restore(restorer, frame):
         return frame
 
 
+def _prepare_blend_mask(image, face_box, fp, mode="jaw", upper_boundary_ratio=0.5, expand=1.5):
+    """
+    The blend mask of upstream `get_image`, computed once instead of per frame.
+
+    The mask is derived from the original frame only, never from the generated
+    mouth, so for a fixed frame and bbox it is constant across the whole clip.
+    Upstream's `get_image_prepare_material` is not used because it blurs with a
+    0.1 kernel ratio while `get_image` uses 0.05; this keeps output identical.
+    """
+    body = Image.fromarray(image[:, :, ::-1])
+    x, y, x1, y1 = face_box
+    crop_box, _ = get_crop_box(face_box, expand)
+    x_s, y_s, _, _ = crop_box
+    face_large = body.crop(crop_box)
+    ori_shape = face_large.size
+
+    mask_image = face_seg(face_large, mode=mode, fp=fp)
+    mask_small = mask_image.crop((x - x_s, y - y_s, x1 - x_s, y1 - y_s))
+    mask_image = Image.new("L", ori_shape, 0)
+    mask_image.paste(mask_small, (x - x_s, y - y_s, x1 - x_s, y1 - y_s))
+
+    width, height = mask_image.size
+    top_boundary = int(height * upper_boundary_ratio)
+    modified = Image.new("L", ori_shape, 0)
+    modified.paste(mask_image.crop((0, top_boundary, width, height)), (0, top_boundary))
+
+    blur = int(0.05 * ori_shape[0] // 2 * 2) + 1
+    return cv2.GaussianBlur(np.array(modified), (blur, blur), 0), crop_box
+
+
 def _run_job(job, vae, unet, pe, audio_processor, whisper, fp, timesteps, device, restorer=None):
     image_path = job["image"]
     audio_path = job["audio"]
     output_path = job["output"]
     coord_cache = job.get("coord_cache")
+    timings = {}
+    t0 = time.perf_counter()
 
     input_img_list = [image_path]
 
@@ -184,6 +217,9 @@ def _run_job(job, vae, unet, pe, audio_processor, whisper, fp, timesteps, device
     coord_list_cycle: List[Any] = coord_list + list(reversed(coord_list))  # type: ignore[operator]
     latent_list_cycle: List[Any] = input_latent_list + list(reversed(input_latent_list))
 
+    timings["prep"] = time.perf_counter() - t0
+    t0 = time.perf_counter()
+
     # ── UNet inference ───────────────────────────────────────────────────────
     gen = datagen(
         whisper_chunks=whisper_chunks,
@@ -200,32 +236,52 @@ def _run_job(job, vae, unet, pe, audio_processor, whisper, fp, timesteps, device
         for f in vae.decode_latents(pred):
             res_frame_list.append(f)
 
-    # ── blend back ───────────────────────────────────────────────────────────
-    frames_dir = output_path + "_frames"
-    os.makedirs(frames_dir, exist_ok=True)
-    for i, res_frame in enumerate(res_frame_list):
-        bbox = coord_list_cycle[i % len(coord_list_cycle)]
-        ori = copy.deepcopy(frame_list_cycle[i % len(frame_list_cycle)])
-        x1, y1, x2, y2 = bbox
-        y2 = min(y2 + EXTRA_MARGIN, ori.shape[0])
-        try:
-            res_frame = cv2.resize(res_frame.astype(np.uint8), (x2 - x1, y2 - y1))
-        except Exception:
-            continue
-        combined = get_image(ori, res_frame, [x1, y1, x2, y2], mode="jaw", fp=fp)
-        combined = _restore(restorer, combined)
-        cv2.imwrite(f"{frames_dir}/{str(i).zfill(8)}.png", combined)
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    timings["unet"] = time.perf_counter() - t0
+    t0 = time.perf_counter()
 
-    # ── assemble video ───────────────────────────────────────────────────────
-    tmp_vid = output_path + ".tmp.mp4"
-    os.system(
-        f"ffmpeg -y -v warning -r {FPS} -f image2 "
-        f"-i {frames_dir}/%08d.png "
-        f"-vcodec libx264 -vf format=yuv420p -crf 18 {tmp_vid}"
+    # ── blend back, streamed straight into one ffmpeg pass (video + audio) ──
+    height, width = frame_list_cycle[0].shape[:2]
+    ffmpeg = subprocess.Popen(
+        [
+            "ffmpeg", "-y", "-v", "warning",
+            "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{width}x{height}", "-r", str(FPS),
+            "-i", "-",
+            "-i", audio_path,
+            "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+            "-c:a", "aac", "-movflags", "+faststart",
+            output_path,
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,  # stdout is the worker protocol channel
     )
-    os.system(f"ffmpeg -y -v warning -i {audio_path} -i {tmp_vid} {output_path}")
-    shutil.rmtree(frames_dir)
-    os.remove(tmp_vid)
+    masks = {}
+    try:
+        for i, res_frame in enumerate(res_frame_list):
+            idx = i % len(coord_list_cycle)
+            x1, y1, x2, y2 = coord_list_cycle[idx]
+            ori = frame_list_cycle[i % len(frame_list_cycle)]
+            y2 = min(y2 + EXTRA_MARGIN, ori.shape[0])
+            try:
+                res_frame = cv2.resize(res_frame.astype(np.uint8), (x2 - x1, y2 - y1))
+            except Exception:
+                continue
+            if idx not in masks:
+                masks[idx] = _prepare_blend_mask(ori, [x1, y1, x2, y2], fp)
+            mask_array, crop_box = masks[idx]
+            combined = get_image_blending(ori, res_frame, [x1, y1, x2, y2], mask_array, crop_box)
+            combined = _restore(restorer, combined)
+            ffmpeg.stdin.write(np.ascontiguousarray(combined).tobytes())
+    finally:
+        ffmpeg.stdin.close()
+        rc = ffmpeg.wait()
+    if rc != 0:
+        raise RuntimeError(f"ffmpeg exited with code {rc}")
+    timings["blend_encode"] = time.perf_counter() - t0
+    timings["frames"] = len(res_frame_list)
+    return timings
 
 
 def main():
@@ -283,8 +339,12 @@ def main():
         except json.JSONDecodeError:
             continue
         try:
-            _run_job(job, vae, unet, pe, audio_processor, whisper, fp, timesteps, device, restorer)
-            _reply({"id": job.get("id"), "status": "ok", "output": job["output"]})
+            timings = _run_job(
+                job, vae, unet, pe, audio_processor, whisper, fp, timesteps, device, restorer
+            )
+            _reply(
+                {"id": job.get("id"), "status": "ok", "output": job["output"], "timings": timings}
+            )
         except Exception as e:
             _reply(
                 {"id": job.get("id"), "status": "error", "msg": str(e), "tb": traceback.format_exc()}
