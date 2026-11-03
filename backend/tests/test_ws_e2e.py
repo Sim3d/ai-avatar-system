@@ -81,7 +81,7 @@ async def test_ws_full_turn_streams_events(monkeypatch):
     async def fake_resolve_image(avatar):
         return "/tmp/fake-avatar.jpg"
 
-    async def fake_tts(text, output_path, speaker_wav=None, language="en"):
+    async def fake_tts(text, output_path, speaker_wav=None, language="en", voice_id=None):
         from pathlib import Path
 
         Path(output_path).write_bytes(b"wav")

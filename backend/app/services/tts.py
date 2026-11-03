@@ -8,6 +8,9 @@ Fallback chain when Chatterbox can't load or fails mid-synthesis:
 
     chatterbox (cloned voice, GPU) → edge-tts (neural, free, no GPU) → gTTS
 
+Chatterbox runs in-process if importable, or in tts_server.py (its own venv,
+because its torch pin conflicts with MuseTalk) when CHATTERBOX_URL is set.
+
 Edge TTS uses Microsoft's neural voices — dramatically better prosody than
 gTTS — and needs no API key or GPU, so the degraded experience stays good.
 gTTS remains as the last-ditch network fallback.
@@ -18,6 +21,8 @@ notify the user when voice cloning was silently dropped during fallback.
 
 import asyncio
 import logging
+import re
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -67,6 +72,37 @@ _EDGE_VOICES = {
     "zh": "zh-CN-XiaoxiaoNeural",
 }
 
+# Voice Studio preset IDs are persisted on avatars. Keep these mapped to real
+# neural voices instead of letting them collapse to the language default.
+PRESET_EDGE_VOICES = {
+    "default-en": "en-US-GuyNeural",
+    "default-warm": "en-US-JennyNeural",
+    "default-deep": "en-US-DavisNeural",
+    "default-es": "es-ES-ElviraNeural",
+}
+
+# Symbols worth keeping: engines read them meaningfully ("25 degrees").
+_KEEP_SYMBOLS = set("°©®™")
+# Emoji glue: zero-width joiner, variation selectors, keycap combiner.
+_EMOJI_JOINERS = {"\u200d", "\ufe0e", "\ufe0f", "\u20e3"}
+_WHITESPACE_RUN = re.compile(r"[ \t]{2,}")
+
+
+def speakable_text(text: str) -> str:
+    """Drop emoji and pictographs so TTS engines don't read them by name.
+
+    Edge TTS speaks "😊" as "smiling face with smiling eyes". The chat
+    transcript keeps the emoji; only the audio path is cleaned.
+    """
+    cleaned = "".join(
+        ch
+        for ch in text
+        if ch not in _EMOJI_JOINERS
+        and (ch in _KEEP_SYMBOLS or unicodedata.category(ch) not in ("So", "Sk", "Cs"))
+    )
+    return _WHITESPACE_RUN.sub(" ", cleaned).strip()
+
+
 # Older configs may still say "coqui"/"xtts" (the engine Chatterbox replaced).
 # Treat them as chatterbox instead of breaking every synthesis call.
 _LEGACY_PROVIDER_ALIASES = {"coqui": "chatterbox", "xtts": "chatterbox", "xtts_v2": "chatterbox"}
@@ -85,6 +121,7 @@ class TTSService:
             provider = _LEGACY_PROVIDER_ALIASES[provider]
         self.provider = provider
         self.model = None
+        self._load_error: Optional[Exception] = None
         self._init_lock = asyncio.Lock()
 
     def _check_cuda(self) -> bool:
@@ -104,10 +141,16 @@ class TTSService:
         """
         if self.model is not None:
             return
+        # A failed load (Chatterbox not installed, OOM, no weights) won't fix
+        # itself mid-process; retrying on every sentence only adds latency.
+        if self._load_error is not None:
+            raise self._load_error
 
         async with self._init_lock:
             if self.model is not None:  # re-check: another coroutine may have just finished
                 return
+            if self._load_error is not None:
+                raise self._load_error
 
             if self.provider != "chatterbox":
                 raise ValueError(f"Unsupported TTS provider: {self.provider}")
@@ -123,7 +166,10 @@ class TTSService:
                 logger.info(f"Chatterbox loaded (sr={self.model.sr}, device={device})")
 
             except Exception as e:
-                logger.error(f"Failed to load Chatterbox: {e}")
+                logger.error(
+                    f"Failed to load Chatterbox: {e} — using Edge TTS until the backend restarts"
+                )
+                self._load_error = e
                 raise
 
     async def synthesize(
@@ -132,6 +178,7 @@ class TTSService:
         output_path: str,
         speaker_wav: Optional[str] = None,
         language: str = "en",
+        voice_id: Optional[str] = None,
     ) -> SynthResult:
         """
         Synthesize speech.
@@ -141,6 +188,9 @@ class TTSService:
             output_path: Destination WAV path.
             speaker_wav: Optional reference audio for voice cloning (≥10s recommended).
             language: 2-letter code from Chatterbox's 23-language set.
+            voice_id: Optional Voice Studio preset ID. Presets use their named
+                Edge neural voice; custom profile IDs are resolved to speaker_wav
+                by the WebSocket session before synthesis.
 
         Returns:
             SynthResult describing the WAV path and which engine was used.
@@ -148,16 +198,50 @@ class TTSService:
             and gTTS was used instead — voice cloning is lost in that case.
         """
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        text = speakable_text(text)
+        if not text:
+            raise ValueError("Nothing speakable in text")
+
+        preset_voice = PRESET_EDGE_VOICES.get(voice_id or "")
+        if preset_voice and not speaker_wav:
+            try:
+                await self._edge_fallback(text, output_path, language, voice=preset_voice)
+                return SynthResult(
+                    output_path=output_path,
+                    engine="edge-tts",
+                    fallback=False,
+                    voice_cloned=False,
+                )
+            except Exception as edge_err:
+                logger.warning(
+                    f"Preset voice {voice_id!r} failed ({edge_err}), falling back to gTTS"
+                )
+                await self._gtts_fallback(text, output_path, language)
+                return SynthResult(
+                    output_path=output_path,
+                    engine="gtts",
+                    fallback=True,
+                    voice_cloned=False,
+                )
 
         try:
+            if speaker_wav and not Path(speaker_wav).exists():
+                logger.warning(f"Speaker WAV not found: {speaker_wav!r} — using default voice")
+                speaker_wav = None
+
+            if settings.CHATTERBOX_URL:
+                await self._remote_chatterbox(text, output_path, speaker_wav, language)
+                return SynthResult(
+                    output_path=output_path,
+                    engine="chatterbox",
+                    fallback=False,
+                    voice_cloned=bool(speaker_wav),
+                )
+
             if self.model is None:
                 await self.initialize()
 
             logger.info(f"Synthesizing (chatterbox, lang={language}): {text[:80]}...")
-
-            if speaker_wav and not Path(speaker_wav).exists():
-                logger.warning(f"Speaker WAV not found: {speaker_wav!r} — using default voice")
-                speaker_wav = None
 
             kwargs = {"language_id": language}
             if speaker_wav:
@@ -202,12 +286,41 @@ class TTSService:
                 voice_cloned=False,
             )
 
-    async def _edge_fallback(self, text: str, output_path: str, language: str = "en") -> str:
+    async def _remote_chatterbox(
+        self,
+        text: str,
+        output_path: str,
+        speaker_wav: Optional[str],
+        language: str,
+    ) -> str:
+        """Synthesize via tts_server.py, which runs Chatterbox in its own venv."""
+        import httpx
+
+        url = settings.CHATTERBOX_URL.rstrip("/") + "/synthesize"
+        logger.info(f"Synthesizing (chatterbox remote, lang={language}): {text[:80]}...")
+        files = None
+        if speaker_wav:
+            files = {"speaker_wav": ("speaker.wav", Path(speaker_wav).read_bytes(), "audio/wav")}
+        # Short connect timeout: if the service is down, fall back fast.
+        timeout = httpx.Timeout(settings.CHATTERBOX_TIMEOUT, connect=2.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(url, data={"text": text, "language": language}, files=files)
+            resp.raise_for_status()
+        Path(output_path).write_bytes(resp.content)
+        return output_path
+
+    async def _edge_fallback(
+        self,
+        text: str,
+        output_path: str,
+        language: str = "en",
+        voice: Optional[str] = None,
+    ) -> str:
         """Free neural-voice fallback via Microsoft Edge TTS (no key, no GPU)."""
         import edge_tts
         from pydub import AudioSegment
 
-        voice = _EDGE_VOICES.get(language, _EDGE_VOICES["en"])
+        voice = voice or _EDGE_VOICES.get(language, _EDGE_VOICES["en"])
         logger.info(f"Synthesizing (edge-tts, {voice}): {text[:80]}...")
         mp3_path = str(Path(output_path).with_suffix(".edge.mp3"))
 
@@ -293,7 +406,7 @@ class TTSService:
 
 
 # Suppress unused-name warning — re-exported for type hints elsewhere
-__all__ = ["TTSService", "SynthResult", "tts_service"]
+__all__ = ["TTSService", "SynthResult", "speakable_text", "tts_service"]
 
 
 # Global instance

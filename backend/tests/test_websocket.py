@@ -217,6 +217,22 @@ async def test_set_voice_rejects_cross_tenant(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_set_voice_accepts_preset_without_custom_profile(monkeypatch):
+    m = ConnectionManager()
+    _wire_session(m)
+
+    async def should_not_lookup(voice_id):
+        raise AssertionError("built-in presets do not need a voice profile")
+
+    monkeypatch.setattr(m, "_get_voice_entry", should_not_lookup)
+    ok = await m.set_voice_by_id("s1", "default-deep")
+
+    assert ok is True
+    assert m.session_data["s1"]["voice_id"] == "default-deep"
+    assert m.session_data["s1"]["voice_wav"] is None
+
+
+@pytest.mark.asyncio
 async def test_audio_transcribed_in_session_language(monkeypatch):
     """STT must use the session's selected language, not always English."""
     import base64

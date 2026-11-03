@@ -132,6 +132,10 @@ class Settings(BaseSettings):
     # TTS Configuration
     # chatterbox: Resemble AI's open-source SOTA TTS (default, voice cloning + 23 langs)
     TTS_PROVIDER: str = "chatterbox"
+    # URL of tts_server.py running in its own venv (e.g. http://127.0.0.1:8001).
+    # When set, Chatterbox is called over HTTP instead of imported in-process.
+    CHATTERBOX_URL: Optional[str] = None
+    CHATTERBOX_TIMEOUT: float = 120.0
 
     # Security
     # Union[..., str] lets pydantic-settings keep a non-JSON env value as a

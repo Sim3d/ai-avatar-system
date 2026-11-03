@@ -19,12 +19,12 @@
 #
 #   python -m venv venv-tts
 #   ./venv-tts/bin/pip install -r requirements-tts.txt
+#   ./venv-tts/bin/python tts_server.py          # then CHATTERBOX_URL=http://127.0.0.1:8001
 #
 # WITHOUT IT
-# Nothing breaks. app/services/tts.py imports chatterbox inside a try/except
-# and falls through to Edge TTS (free Microsoft neural voices, CPU-only) and
-# then gTTS. Voice cloning is the only feature you lose; set
-# TTS_PROVIDER=chatterbox only when this file is actually installed.
+# Nothing breaks. Without CHATTERBOX_URL, app/services/tts.py tries an
+# in-process import, and falls through to Edge TTS (free Microsoft neural
+# voices, CPU-only) and then gTTS. Voice cloning is the only feature you lose.
 
 chatterbox-tts==0.1.7
 
@@ -34,3 +34,8 @@ torch==2.6.0
 torchaudio==2.6.0
 transformers==5.2.0
 librosa==0.11.0
+
+# HTTP wrapper (tts_server.py) so the backend can call this venv remotely.
+fastapi>=0.110
+uvicorn>=0.27
+python-multipart>=0.0.9

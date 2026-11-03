@@ -64,6 +64,20 @@ if [ -f "$MUSETALK_DIR/scripts/inference.py" ] \
         | sed -u 's/^/[musetalk-download] /' ) &
 fi
 
+# Chatterbox sidecar for cloned voices (venv baked by the Dockerfile). The
+# backend only uses it when CHATTERBOX_URL is set, and falls back to Edge TTS
+# while it is still loading or if it dies. Set CHATTERBOX_URL yourself to use
+# an external service instead, or ENABLE_CHATTERBOX=0 to disable it.
+TTS_VENV_PY=/opt/venv-tts/bin/python
+if [ -z "${CHATTERBOX_URL:-}" ] && [ "${ENABLE_CHATTERBOX:-1}" != "0" ] \
+    && [ -x "$TTS_VENV_PY" ] && [ -f tts_server.py ]; then
+    export TTS_PORT="${TTS_PORT:-8001}"
+    echo "[startup] Starting Chatterbox TTS service on 127.0.0.1:${TTS_PORT}"
+    ( TTS_HOST=127.0.0.1 "$TTS_VENV_PY" -u tts_server.py 2>&1 \
+        | sed -u 's/^/[chatterbox] /' ) &
+    export CHATTERBOX_URL="http://127.0.0.1:${TTS_PORT}"
+fi
+
 echo "[startup] Starting uvicorn..."
 # --forwarded-allow-ips decides whose X-Forwarded-For we believe.
 #

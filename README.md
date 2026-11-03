@@ -528,22 +528,31 @@ Powered by [Chatterbox Multilingual](https://github.com/resemble-ai/chatterbox) 
 2. Record 10–60 s of clear speech (or upload a WAV/MP3/WebM)
 3. Name it → **Clone** → select it for your session
 
-Every TTS response then uses your cloned voice.
+The built-in Alex, Jordan, Morgan, and Sofia presets use their corresponding
+Microsoft neural voices. A custom cloned profile needs Chatterbox, which runs
+as a separate service (`backend/tts_server.py`) in its own virtualenv.
 
 > **Chatterbox needs its own environment.** It is *not* in `requirements.txt`,
 > because it pins `torch==2.6.0` / `transformers==5.2.0` / `librosa==0.11.0`
 > while the MuseTalk lip-sync pipeline needs torch 2.2 / transformers 4.37 —
-> the two cannot share one virtualenv. Install it separately:
+> the two cannot share one virtualenv. Run it as a sidecar service on the same
+> GPU machine (Python 3.10/3.11):
 >
 > ```bash
+> cd backend
 > python -m venv venv-tts
-> ./venv-tts/bin/pip install -r backend/requirements-tts.txt
+> ./venv-tts/bin/pip install -r requirements-tts.txt
+> ./venv-tts/bin/python tts_server.py          # listens on 127.0.0.1:8001
 > ```
 >
+> Then set `CHATTERBOX_URL=http://127.0.0.1:8001` in the backend `.env` and
+> restart it. The backend uploads the profile WAV with each request, so the two
+> processes don't need to share `voice_profiles/`. `TTS_HOST`, `TTS_PORT`, and
+> `TTS_DEVICE` configure the service; it has no auth, so keep it private.
+>
 > Without it nothing breaks: TTS falls through to **edge-tts** (free Microsoft
-> neural voices, CPU-only) and then gTTS. Voice cloning is the only feature
-> that requires Chatterbox, so set `TTS_PROVIDER=chatterbox` only once it is
-> actually installed.
+> neural voices, CPU-only) and then gTTS. Existing voice profiles don't need to
+> be re-recorded — they're used as soon as the service is reachable.
 
 ```bash
 # REST API
@@ -647,9 +656,10 @@ AVATAR_ENGINE=musetalk            # musetalk (default) | liveavatar (48GB+) | si
 MUSETALK_PATH=models/MuseTalk
 
 # TTS — automatic fallback chain: chatterbox → edge-tts → gtts
-# chatterbox requires backend/requirements-tts.txt in its own venv (see
-# "Voice Cloning"); without it this transparently uses edge-tts.
+# chatterbox runs as backend/tts_server.py in its own venv (see "Voice
+# Cloning"); without CHATTERBOX_URL this transparently uses edge-tts.
 TTS_PROVIDER=chatterbox
+CHATTERBOX_URL=http://127.0.0.1:8001
 
 # STT
 WHISPER_MODEL=large-v3-turbo      # tiny | base | small | medium | large-v3 | large-v3-turbo

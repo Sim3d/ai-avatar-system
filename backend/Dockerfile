@@ -31,6 +31,7 @@ RUN set -eux; \
                 -o Acquire::http::Timeout=30 \
                 python3.10 \
                 python3.10-dev \
+                python3.10-venv \
                 python3-pip \
                 ffmpeg \
                 libsm6 \
@@ -94,6 +95,20 @@ RUN pip freeze | grep -iE '^(torch|torchvision|torchaudio|numpy|opencv-python)==
     && python -c "from facexlib.detection import init_detection_model; from facexlib.parsing import init_parsing_model; init_detection_model('retinaface_resnet50', half=False, device='cpu', model_rootpath='gfpgan/weights'); init_parsing_model(model_name='parsenet', half=False, device='cpu', model_rootpath='gfpgan/weights')" \
     && python -c "from gfpgan import GFPGANer" \
     && rm /tmp/pins.txt
+
+# Chatterbox voice cloning. Its torch 2.6 / transformers 5 stack cannot share
+# site-packages with MuseTalk's torch 2.2, so it gets its own venv and runs as
+# tts_server.py on 127.0.0.1:8001, started by entrypoint.sh. Weights download
+# on first boot into HF_HOME. Build with --build-arg INSTALL_CHATTERBOX=0 to
+# skip it (~6 GB); TTS then falls back to Edge TTS without cloned voices.
+ARG INSTALL_CHATTERBOX=1
+COPY requirements-tts.txt .
+RUN if [ "$INSTALL_CHATTERBOX" = "1" ]; then \
+        python3.10 -m venv /opt/venv-tts \
+        && /opt/venv-tts/bin/pip install --no-cache-dir --upgrade pip \
+        && /opt/venv-tts/bin/pip install --no-cache-dir -r requirements-tts.txt \
+        && /opt/venv-tts/bin/python -c "import chatterbox, fastapi, uvicorn"; \
+    fi
 
 # Copy application code
 COPY . .

@@ -24,7 +24,7 @@ from app.services.llm import (
 )
 from app.services.storage import storage_service
 from app.services.stt import stt_service
-from app.services.tts import tts_service
+from app.services.tts import PRESET_EDGE_VOICES, speakable_text, tts_service
 from app.telemetry import span
 
 logger = logging.getLogger(__name__)
@@ -221,6 +221,7 @@ class ConnectionManager:
             "avatar_image_key": None,
             "avatar_image_local": None,
             "voice_wav": None,
+            "voice_id": None,
             "language": "en",
             "system_prompt": None,
             # Running summary of turns that have fallen out of the context
@@ -415,6 +416,7 @@ class ConnectionManager:
                         logger.info(f"Loaded system prompt for avatar {avatar.id}")
 
                     if avatar.voice_id:
+                        self.session_data[session_id]["voice_id"] = avatar.voice_id
                         wav = await self._get_voice_wav_path(avatar.voice_id)
                         if wav:
                             self.session_data[session_id]["voice_wav"] = wav
@@ -873,6 +875,7 @@ class ConnectionManager:
         data = self.session_data.get(session_id, {})
         avatar_image = data.get("avatar_image_local")
         speaker_wav: Optional[str] = data.get("voice_wav")
+        voice_id: Optional[str] = data.get("voice_id")
         language: str = data.get("language", "en")
 
         # If no avatar image, drain queue silently
@@ -889,6 +892,7 @@ class ConnectionManager:
         # Only warn about TTS fallback once per turn — repeated warnings on
         # every sentence would be noisy. We reset this in the enclosing turn.
         fallback_announced = False
+        session_dir = _private_session_dir(session_id)
 
         await self.send_message(
             session_id,
@@ -898,95 +902,146 @@ class ConnectionManager:
             },
         )
 
-        while True:
-            sentence = await queue.get()
-            if sentence is None:
-                break
+        # Two-stage pipeline: TTS for sentence N+1 runs while sentence N is
+        # being animated, so the gap between clips is max(TTS, animation)
+        # instead of TTS + animation.
+        audio_queue: "asyncio.Queue[Optional[tuple[str, Path]]]" = asyncio.Queue(maxsize=2)
 
-            if session_id not in self.active_connections:
-                break  # client disconnected mid-stream
-
-            job_id = uuid.uuid4().hex[:12]
-            session_dir = _private_session_dir(session_id)
-            tmp_audio = session_dir / f"{job_id}_audio.wav"
-            tmp_video = session_dir / f"{job_id}_video.mp4"
-
+        async def synthesize_stage() -> None:
+            nonlocal fallback_announced
+            sentence: Optional[str] = ""
             try:
-                await self.send_message(
-                    session_id,
-                    {
-                        "type": "status",
-                        "message": "Animating…",
-                        "stage": "animation",
-                    },
-                )
+                while True:
+                    sentence = await queue.get()
+                    if sentence is None or session_id not in self.active_connections:
+                        break
+                    if not speakable_text(sentence):
+                        continue  # emoji-only chunk — nothing to say or animate
 
-                with span(
-                    "tts.synthesize",
-                    **{"chars": len(sentence), "lang": language, "cloned": bool(speaker_wav)},
-                ):
-                    synth = await tts_service.synthesize(
-                        text=sentence,
-                        output_path=str(tmp_audio),
-                        speaker_wav=speaker_wav,
-                        language=language,
-                    )
+                    tmp_audio = session_dir / f"{uuid.uuid4().hex[:12]}_audio.wav"
+                    try:
+                        with span(
+                            "tts.synthesize",
+                            **{
+                                "chars": len(sentence),
+                                "lang": language,
+                                "cloned": bool(speaker_wav),
+                            },
+                        ):
+                            synth = await tts_service.synthesize(
+                                text=sentence,
+                                output_path=str(tmp_audio),
+                                speaker_wav=speaker_wav,
+                                language=language,
+                                voice_id=voice_id,
+                            )
+                    except asyncio.CancelledError:
+                        tmp_audio.unlink(missing_ok=True)
+                        raise
+                    except Exception as e:
+                        logger.error(f"TTS failed [{session_id}]: {e}")
+                        tmp_audio.unlink(missing_ok=True)
+                        continue
 
-                # Notify the client exactly once if Chatterbox bailed and
-                # we ended up serving the un-cloned gTTS voice instead.
-                if synth.fallback and not fallback_announced:
-                    fallback_announced = True
+                    # Notify the client exactly once if Chatterbox bailed and
+                    # we ended up serving an un-cloned voice instead.
+                    if synth.fallback and not fallback_announced:
+                        fallback_announced = True
+                        await self.send_message(
+                            session_id,
+                            {
+                                "type": "tts_fallback",
+                                "engine": synth.engine,
+                                "voice_cloned": synth.voice_cloned,
+                                "message": (
+                                    "Cloned voice unavailable — using default voice for this reply."
+                                    if speaker_wav
+                                    else f"Voice engine fell back to {synth.engine} for this reply."
+                                ),
+                            },
+                        )
+
+                    await audio_queue.put((sentence, tmp_audio))
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"TTS stage failed [{session_id}]: {e}")
+
+            # Keep the LLM producer unblocked if we stopped early (disconnect).
+            if sentence is not None:
+                while (await queue.get()) is not None:
+                    pass
+            await audio_queue.put(None)
+
+        async def animate_stage() -> None:
+            nonlocal chunk_index, sent_any
+            while True:
+                item = await audio_queue.get()
+                if item is None:
+                    break
+                sentence, tmp_audio = item
+                tmp_video = tmp_audio.with_name(tmp_audio.name.replace("_audio.wav", "_video.mp4"))
+
+                if session_id not in self.active_connections:
+                    tmp_audio.unlink(missing_ok=True)
+                    continue  # keep draining so synthesize_stage can finish
+
+                try:
                     await self.send_message(
                         session_id,
                         {
-                            "type": "tts_fallback",
-                            "engine": synth.engine,
-                            "voice_cloned": synth.voice_cloned,
-                            "message": (
-                                "Cloned voice unavailable — using default voice for this reply."
-                                if speaker_wav
-                                else f"Voice engine fell back to {synth.engine} for this reply."
-                            ),
+                            "type": "status",
+                            "message": "Animating…",
+                            "stage": "animation",
                         },
                     )
 
-                with span("avatar.animate", **{"chunk": chunk_index}):
-                    await avatar_animator.animate(
-                        avatar_image_path=avatar_image,
-                        audio_path=str(tmp_audio),
-                        output_path=str(tmp_video),
+                    with span("avatar.animate", **{"chunk": chunk_index}):
+                        await avatar_animator.animate(
+                            avatar_image_path=avatar_image,
+                            audio_path=str(tmp_audio),
+                            output_path=str(tmp_video),
+                        )
+
+                    ts = int(datetime.now(timezone.utc).timestamp() * 1000)
+                    video_key = f"videos/{session_id}/{ts}_c{chunk_index}.mp4"
+                    with span("storage.upload", **{"chunk": chunk_index}):
+                        await storage_service.upload_file(
+                            tmp_video.read_bytes(), video_key, content_type="video/mp4"
+                        )
+                        # S3 objects are private — hand the client a URL it can
+                        # actually fetch (presigned on S3, /uploads/ locally).
+                        video_url = await storage_service.serving_url(video_key)
+
+                    await self.send_message(
+                        session_id,
+                        {
+                            "type": "video_chunk",
+                            "chunk_index": chunk_index,
+                            "total_chunks": -1,
+                            "video_url": video_url,
+                            "text": sentence,
+                        },
                     )
+                    chunk_index = chunk_index + 1
+                    sent_any = True
+                    logger.info(f"Chunk {chunk_index} ready [{session_id}]")
 
-                ts = int(datetime.now(timezone.utc).timestamp() * 1000)
-                video_key = f"videos/{session_id}/{ts}_c{chunk_index}.mp4"
-                with span("storage.upload", **{"chunk": chunk_index}):
-                    await storage_service.upload_file(
-                        tmp_video.read_bytes(), video_key, content_type="video/mp4"
-                    )
-                    # S3 objects are private — hand the client a URL it can
-                    # actually fetch (presigned on S3, /uploads/ locally).
-                    video_url = await storage_service.serving_url(video_key)
+                except Exception as e:
+                    logger.error(f"Chunk {chunk_index} failed [{session_id}]: {e}")
 
-                await self.send_message(
-                    session_id,
-                    {
-                        "type": "video_chunk",
-                        "chunk_index": chunk_index,
-                        "total_chunks": -1,
-                        "video_url": video_url,
-                        "text": sentence,
-                    },
-                )
-                chunk_index = chunk_index + 1
-                sent_any = True
-                logger.info(f"Chunk {chunk_index} ready [{session_id}]")
+                finally:
+                    tmp_audio.unlink(missing_ok=True)
+                    tmp_video.unlink(missing_ok=True)
 
-            except Exception as e:
-                logger.error(f"Chunk {chunk_index} failed [{session_id}]: {e}")
-
-            finally:
-                tmp_audio.unlink(missing_ok=True)
-                tmp_video.unlink(missing_ok=True)
+        try:
+            await asyncio.gather(synthesize_stage(), animate_stage())
+        finally:
+            # On cancellation (barge-in), drop audio that was never animated.
+            while not audio_queue.empty():
+                leftover = audio_queue.get_nowait()
+                if leftover is not None:
+                    leftover[1].unlink(missing_ok=True)
 
         await self.send_message(
             session_id,
@@ -1017,6 +1072,11 @@ class ConnectionManager:
         """
         if session_id not in self.session_data:
             return False
+        if voice_id in PRESET_EDGE_VOICES:
+            self.session_data[session_id]["voice_id"] = voice_id
+            self.session_data[session_id]["voice_wav"] = None
+            logger.info(f"Preset voice set [{session_id}]: voice_id={voice_id}")
+            return True
         entry = await self._get_voice_entry(voice_id)
         if not entry:
             return False
@@ -1035,6 +1095,7 @@ class ConnectionManager:
         if not wav:
             return False
         self.session_data[session_id]["voice_wav"] = wav
+        self.session_data[session_id]["voice_id"] = voice_id
         logger.info(f"Voice set [{session_id}]: voice_id={voice_id}")
         return True
 
