@@ -5,6 +5,7 @@ import logging
 import os
 import sys
 import tempfile
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -147,6 +148,35 @@ class AvatarAnimator:
                 return p.resolve()
         return None
 
+    # BiSeNet is downloaded last (see download_musetalk_weights.py), so its
+    # presence alongside the unet means the whole weight set is in place.
+    _MUSETALK_WEIGHT_MARKERS = (
+        "models/musetalkV15/unet.pth",
+        "models/face-parse-bisent/79999_iter.pth",
+    )
+
+    def _musetalk_weights_ready(self) -> bool:
+        """
+        True once the MuseTalk weights are on disk. In containers they are
+        fetched in the background on first boot, so this is re-checked on every
+        call rather than latched: requests use the simple engine until the
+        download completes, then switch to MuseTalk without a restart.
+        """
+        if getattr(self, "_weights_ready", False) or self._musetalk_dir is None:
+            return getattr(self, "_weights_ready", False)
+        ready = all((self._musetalk_dir / m).exists() for m in self._MUSETALK_WEIGHT_MARKERS)
+        if ready:
+            self._weights_ready = True
+            logger.info("MuseTalk weights ready — lip-sync enabled.")
+        elif not getattr(self, "_weights_missing_logged", False):
+            self._weights_missing_logged = True
+            logger.warning(
+                "MuseTalk code found but weights are missing under %s/models "
+                "(download in progress?). Using simple animation until they arrive.",
+                self._musetalk_dir,
+            )
+        return ready
+
     # ── persistent worker management ─────────────────────────────────────────
 
     async def _ensure_worker(self) -> asyncio.subprocess.Process:
@@ -232,9 +262,11 @@ class AvatarAnimator:
         async with self._worker_lock:
             proc = await self._ensure_worker()
 
+            job_id = uuid.uuid4().hex
             job = (
                 json.dumps(
                     {
+                        "id": job_id,
                         "image": str(Path(image_path).resolve()),
                         "audio": str(Path(audio_path).resolve()),
                         "output": str(Path(output_path).resolve()),
@@ -255,24 +287,43 @@ class AvatarAnimator:
                 self._worker_proc = None
                 raise RuntimeError(f"MuseTalk worker pipe is dead: {e}") from e
 
-            # GPU: expect ~5-15s per sentence; CPU: up to 5 min
-            infer_timeout = 60 if self.device == "cuda" else 300
-            try:
-                result_line = await asyncio.wait_for(proc.stdout.readline(), timeout=infer_timeout)
-            except asyncio.TimeoutError:
-                proc.kill()
-                self._worker_proc = None
-                raise RuntimeError(f"MuseTalk inference timed out after {infer_timeout}s")
+            # GPU: ~5-15s per sentence, plus per-frame face restoration when
+            # enabled; CPU: up to 5 min.
+            infer_timeout = 180 if self.device == "cuda" else 300
+            deadline = asyncio.get_running_loop().time() + infer_timeout
+            while True:
+                remaining = deadline - asyncio.get_running_loop().time()
+                try:
+                    if remaining <= 0:
+                        raise asyncio.TimeoutError
+                    result_line = await asyncio.wait_for(proc.stdout.readline(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    self._worker_proc = None
+                    raise RuntimeError(f"MuseTalk inference timed out after {infer_timeout}s")
 
-            # Empty read == worker exited mid-job (EOF on stdout). Reset so the
-            # next call respawns instead of erroring on a half-dead process.
-            if not result_line:
-                proc.kill()
-                self._worker_proc = None
-                raise RuntimeError("MuseTalk worker exited before returning a result")
+                # Empty read == worker exited mid-job (EOF on stdout). Reset so the
+                # next call respawns instead of erroring on a half-dead process.
+                if not result_line:
+                    proc.kill()
+                    self._worker_proc = None
+                    raise RuntimeError("MuseTalk worker exited before returning a result")
 
-            result = json.loads(result_line.decode().strip())
+                try:
+                    result = json.loads(result_line.decode().strip())
+                except json.JSONDecodeError:
+                    continue
+                # A caller cancelled mid-job (client disconnect, new turn) leaves
+                # its reply in the pipe; skip it or every later turn reads the
+                # previous turn's result.
+                if result.get("id") != job_id:
+                    logger.warning(f"Discarding stale MuseTalk reply for job {result.get('id')}")
+                    continue
+                break
+
             if result["status"] != "ok":
+                if result.get("tb"):
+                    logger.error(f"MuseTalk worker traceback:\n{result['tb']}")
                 raise RuntimeError(result.get("msg", "Unknown worker error"))
 
             return output_path
@@ -297,6 +348,8 @@ class AvatarAnimator:
         logger.info(f"Animating [{self.engine}] image={avatar_image_path} audio={audio_path}")
 
         try:
+            if self.engine == "musetalk" and not self._musetalk_weights_ready():
+                return await self._animate_simple(avatar_image_path, audio_path, output_path)
             if self.engine == "musetalk":
                 return await self._animate_musetalk(avatar_image_path, audio_path, output_path)
             elif self.engine == "liveavatar":
@@ -320,7 +373,8 @@ class AvatarAnimator:
 
         # Per-avatar face-coordinate cache (saves face-detection on repeat calls)
         avatar_id = hashlib.md5(str(Path(avatar_path).resolve()).encode()).hexdigest()
-        coord_cache = str(musetalk_dir / "results" / "coords" / f"{avatar_id}.pkl")
+        # ".v2": crop now matches upstream framing; older caches hold the old bbox.
+        coord_cache = str(musetalk_dir / "results" / "coords" / f"{avatar_id}.v2.pkl")
         os.makedirs(os.path.dirname(coord_cache), exist_ok=True)
 
         await self._worker_infer(avatar_path, audio_path, output_path, coord_cache)

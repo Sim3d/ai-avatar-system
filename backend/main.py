@@ -254,6 +254,9 @@ async def health_check(response: Response):
         services["llm"] = (
             f"ready (ollama @ {settings.OPENAI_BASE_URL or 'http://localhost:11434/v1'})"
         )
+    elif settings.LLM_PROVIDER == "bedrock":
+        # Authenticated through the task IAM role — no API key to check.
+        services["llm"] = f"ready (bedrock, model {settings.LLM_MODEL})"
     else:
         services["llm"] = f"unknown provider: {settings.LLM_PROVIDER}"
         if health["status"] == "healthy":

@@ -118,6 +118,24 @@ resource "aws_cloudfront_distribution" "media_cdn" {
     }
   }
 
+  # ALB as a second origin so the API and WebSocket endpoints are reachable
+  # over HTTPS (the ALB itself is HTTP-only; HTTPS pages such as the Konekt
+  # shell cannot call it directly because of mixed-content blocking).
+  origin {
+    domain_name = aws_lb.main.dns_name
+    origin_id   = "ALB-${var.project_name}-${var.environment}"
+
+    custom_origin_config {
+      http_port              = 80
+      https_port             = 443
+      origin_protocol_policy = "http-only"
+      origin_ssl_protocols   = ["TLSv1.2"]
+      # API calls and WebSocket turns can be long-lived.
+      origin_read_timeout      = 60
+      origin_keepalive_timeout = 60
+    }
+  }
+
   enabled             = true
   is_ipv6_enabled     = true
   comment             = "CDN for avatar media"
@@ -140,6 +158,22 @@ resource "aws_cloudfront_distribution" "media_cdn" {
     min_ttl                = 0
     default_ttl            = 3600
     max_ttl                = 86400
+  }
+
+  # API / WebSocket / health behaviors: no caching, forward everything.
+  # Managed policies: CachingDisabled + AllViewerExceptHostHeader.
+  dynamic "ordered_cache_behavior" {
+    for_each = ["/api/*", "/ws/*", "/health"]
+    content {
+      path_pattern             = ordered_cache_behavior.value
+      allowed_methods          = ["GET", "HEAD", "OPTIONS", "PUT", "POST", "PATCH", "DELETE"]
+      cached_methods           = ["GET", "HEAD"]
+      target_origin_id         = "ALB-${var.project_name}-${var.environment}"
+      cache_policy_id          = "4135ea2d-6df8-44a3-9df3-4b5a84be39ad"
+      origin_request_policy_id = "b689b0a8-53d0-40ab-baf2-68738e2966ac"
+      viewer_protocol_policy   = "redirect-to-https"
+      compress                 = true
+    }
   }
 
   restrictions {

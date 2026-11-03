@@ -63,8 +63,44 @@ RUN pip install --no-cache-dir \
     torchaudio==2.2.0+cu118 \
     --index-url https://download.pytorch.org/whl/cu118
 
+# MuseTalk lip-sync code, pinned to a known commit. Only the code lives in the
+# image: the ~9 GB of weights are downloaded on first boot by entrypoint.sh into
+# models/MuseTalk/models, which is meant to be a persistent volume.
+ARG MUSETALK_COMMIT=0a89dec45a0192b824e3cf4daf96c239440c5ed8
+RUN git init -q models/MuseTalk \
+    && git -C models/MuseTalk fetch -q --depth 1 https://github.com/TMElyralab/MuseTalk.git "${MUSETALK_COMMIT}" \
+    && git -C models/MuseTalk checkout -q FETCH_HEAD \
+    && rm -rf models/MuseTalk/.git \
+    && pip install --no-cache-dir einops gdown huggingface_hub
+
+# Optional GFPGAN face restoration (enabled with FACE_RESTORE=gfpgan).
+# basicsr builds from source: --no-build-isolation makes it reuse the torch
+# already installed instead of pulling another one, and the constraints file
+# keeps gfpgan's deps from moving the torch/numpy/opencv pins.
+# Weights are baked under /app/gfpgan rather than the models volume so they are
+# usable from the very first boot. facexlib helpers go to gfpgan/weights under
+# the MuseTalk dir because GFPGANer resolves that path relative to the worker cwd.
+COPY requirements-face-restore.txt .
+ENV FACE_RESTORE_MODEL=/app/gfpgan/GFPGANv1.4.pth
+RUN pip freeze | grep -iE '^(torch|torchvision|torchaudio|numpy|opencv-python)==' > /tmp/pins.txt \
+    && pip install --no-cache-dir --no-build-isolation -c /tmp/pins.txt -r requirements-face-restore.txt \
+    && python -c "import torch, torchvision; print('torch', torch.__version__, 'torchvision', torchvision.__version__); assert torch.__version__.startswith('2.2.0'), 'gfpgan install moved torch'" \
+    && sed -i 's/torchvision.transforms.functional_tensor/torchvision.transforms.functional/' \
+        /usr/local/lib/python3.10/dist-packages/basicsr/data/degradations.py \
+    && mkdir -p /app/gfpgan \
+    && curl -fSL --retry 5 --retry-delay 5 -o /app/gfpgan/GFPGANv1.4.pth \
+        https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.4.pth \
+    && cd models/MuseTalk \
+    && python -c "from facexlib.detection import init_detection_model; from facexlib.parsing import init_parsing_model; init_detection_model('retinaface_resnet50', half=False, device='cpu', model_rootpath='gfpgan/weights'); init_parsing_model(model_name='parsenet', half=False, device='cpu', model_rootpath='gfpgan/weights')" \
+    && python -c "from gfpgan import GFPGANer" \
+    && rm /tmp/pins.txt
+
 # Copy application code
 COPY . .
+
+# Swap in the mmpose-free preprocessing and the persistent worker script.
+RUN cp musetalk_preprocessing.py models/MuseTalk/musetalk/utils/preprocessing.py \
+    && cp musetalk_worker.py models/MuseTalk/scripts/musetalk_worker.py
 
 # Create necessary directories
 RUN mkdir -p /tmp/avatars /tmp/videos /tmp/audio voice_profiles

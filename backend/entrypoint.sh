@@ -8,14 +8,9 @@ import os, sys
 try:
     import psycopg2
     url = os.environ.get('DATABASE_URL', '')
-    # parse minimal connection params from the URL
-    import urllib.parse as up
-    r = up.urlparse(url)
-    psycopg2.connect(
-        host=r.hostname, port=r.port or 5432,
-        dbname=r.path.lstrip('/'), user=r.username, password=r.password,
-        connect_timeout=3,
-    ).close()
+    # psycopg2 parses the URL itself and percent-decodes the password;
+    # splitting it manually with urlparse left the password encoded.
+    psycopg2.connect(url, connect_timeout=3).close()
     sys.exit(0)
 except Exception as e:
     sys.exit(1)
@@ -32,11 +27,8 @@ CURRENT=$(alembic current 2>/dev/null || true)
 if [ -z "$CURRENT" ]; then
     # Check if the users table already exists (pre-alembic install)
     TABLES=$(python -c "
-import os, psycopg2, urllib.parse as up
-url = os.environ.get('DATABASE_URL','')
-r = up.urlparse(url)
-conn = psycopg2.connect(host=r.hostname, port=r.port or 5432,
-    dbname=r.path.lstrip('/'), user=r.username, password=r.password)
+import os, psycopg2
+conn = psycopg2.connect(os.environ.get('DATABASE_URL',''), connect_timeout=5)
 cur = conn.cursor()
 cur.execute(\"SELECT to_regclass('public.users')\")
 print(cur.fetchone()[0] or '')
@@ -57,6 +49,20 @@ echo "[startup] Migrations applied successfully."
 
 # Ensure runtime directories exist
 mkdir -p voice_profiles /tmp/avatars /tmp/videos /tmp/audio
+
+# MuseTalk weights (~9 GB) are not baked into the image. On a fresh volume,
+# fetch them in the background so the API comes up immediately; the animator
+# uses the simple engine until the download finishes. BiSeNet is written last,
+# so its presence means the whole set is complete.
+MUSETALK_DIR="${MUSETALK_PATH:-models/MuseTalk}"
+if [ -f "$MUSETALK_DIR/scripts/inference.py" ] \
+    && [ ! -f "$MUSETALK_DIR/models/face-parse-bisent/79999_iter.pth" ]; then
+    mkdir -p "$MUSETALK_DIR/models"
+    echo "[startup] MuseTalk weights missing — downloading in background"
+    # Unbuffered + prefixed so progress shows up in the container log stream.
+    ( python -u download_musetalk_weights.py "$MUSETALK_DIR" 2>&1 \
+        | sed -u 's/^/[musetalk-download] /' ) &
+fi
 
 echo "[startup] Starting uvicorn..."
 # --forwarded-allow-ips decides whose X-Forwarded-For we believe.

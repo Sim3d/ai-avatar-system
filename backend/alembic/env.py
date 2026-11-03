@@ -17,9 +17,12 @@ if config.config_file_name is not None:
 
 target_metadata = Base.metadata
 
-# Override sqlalchemy.url with the async URL from settings
+# Override sqlalchemy.url with the async URL from settings.
+# configparser treats '%' as interpolation syntax, so escape it ('%%'):
+# the URL may contain percent-encoded credentials.
 config.set_main_option(
-    "sqlalchemy.url", settings.DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://")
+    "sqlalchemy.url",
+    settings.DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://").replace("%", "%%"),
 )
 
 

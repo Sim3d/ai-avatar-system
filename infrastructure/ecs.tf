@@ -153,6 +153,26 @@ resource "aws_iam_role_policy" "task_bedrock" {
   policy = data.aws_iam_policy_document.task_bedrock.json
 }
 
+# ECS Exec: lets developers open a shell in running tasks (read worker logs,
+# hot-patch code) without a full rebuild/redeploy cycle.
+data "aws_iam_policy_document" "task_exec" {
+  statement {
+    actions = [
+      "ssmmessages:CreateControlChannel",
+      "ssmmessages:CreateDataChannel",
+      "ssmmessages:OpenControlChannel",
+      "ssmmessages:OpenDataChannel",
+    ]
+    resources = ["*"]
+  }
+}
+
+resource "aws_iam_role_policy" "task_exec" {
+  name   = "${local.name}-ecs-exec"
+  role   = aws_iam_role.task.id
+  policy = data.aws_iam_policy_document.task_exec.json
+}
+
 # EC2 instances that join the cluster.
 data "aws_iam_policy_document" "ec2_assume" {
   statement {
@@ -332,7 +352,9 @@ resource "aws_cloudwatch_log_group" "worker" {
 # ── Shared container config ──────────────────────────────────────────────────
 
 locals {
-  db_url    = "postgresql://${var.db_username}:${urlencode(random_password.db_password.result)}@${aws_db_instance.postgres.address}:5432/${aws_db_instance.postgres.db_name}"
+  # Use the username reported by the RDS instance itself: main.tf hardcodes it,
+  # so referencing var.db_username here could silently drift (and did).
+  db_url    = "postgresql://${aws_db_instance.postgres.username}:${urlencode(random_password.db_password.result)}@${aws_db_instance.postgres.address}:5432/${aws_db_instance.postgres.db_name}"
   redis_url = "redis://${aws_elasticache_cluster.redis.cache_nodes[0].address}:6379"
 
   backend_env = [
@@ -351,12 +373,28 @@ locals {
     # Also enforced at startup: production requires a Secure cookie and https
     # origins, so a misconfiguration fails fast instead of shipping insecurely.
     { name = "AUTH_COOKIE_SECURE", value = "true" },
-    { name = "CORS_ORIGINS", value = var.cors_origins != "" ? var.cors_origins : "https://${aws_lb.main.dns_name}" },
+    # CORS: CloudFront (https API proxy) plus any extra origins supplied via
+    # var.cors_origins (e.g. the Konekt shell in dev). The ALB frontend calls
+    # the API on the same origin, so it does not need a CORS entry; http://
+    # origins are rejected by the backend's production config validation.
+    { name = "CORS_ORIGINS", value = join(",", compact([
+      "https://${aws_cloudfront_distribution.media_cdn.domain_name}",
+      var.cors_origins,
+    ])) },
     { name = "FRONTEND_URL", value = "https://${aws_lb.main.dns_name}" },
     { name = "BACKEND_URL", value = "https://${aws_lb.main.dns_name}" },
     # LLM via Amazon Bedrock: authenticated by the task IAM role, no API key.
     { name = "LLM_PROVIDER", value = var.llm_provider },
     { name = "LLM_MODEL", value = var.llm_model },
+    # One API process => one animator => one MuseTalk worker on the GPU. With
+    # the default 4, each process would load its own copy of the models.
+    { name = "UVICORN_WORKERS", value = "1" },
+    # Keep model caches (face_alignment, HF hub) on the persistent weights
+    # volume so they aren't re-downloaded on every task start.
+    { name = "TORCH_HOME", value = "/app/models/MuseTalk/models/.torch" },
+    { name = "HF_HOME", value = "/app/models/MuseTalk/models/.hf" },
+    # GFPGAN pass on lip-synced frames: sharpens MuseTalk's 256px mouth region.
+    { name = "FACE_RESTORE", value = "gfpgan" },
   ]
 
   backend_secrets = concat(
@@ -377,15 +415,37 @@ resource "aws_ecs_task_definition" "backend" {
   requires_compatibilities = ["EC2"]
   execution_role_arn       = aws_iam_role.task_execution.arn
   task_role_arn            = aws_iam_role.task.arn
-  # Sized for g5.xlarge (4 vCPU / 16 GiB), leaving headroom for the agent.
+  # Sized for g5.xlarge (4 vCPU / 16 GiB, ~15791 MiB registered with ECS).
+  # Must coexist with worker (2048) and frontend (1024) on the same instance:
+  # 12000 + 2048 + 1024 = 15072, leaving headroom for the agent.
   cpu    = 3072
-  memory = 13000
+  memory = 12000
+
+  # Cloned voice samples and their index are written to /app/voice_profiles.
+  # A host bind mount keeps them across task redeploys; they are still lost if
+  # the EC2 instance itself is replaced (move to EFS or S3 if that matters).
+  volume {
+    name      = "voice-profiles"
+    host_path = "/opt/avatar/voice_profiles"
+  }
+
+  # MuseTalk weights (~9 GB) are downloaded on first boot by entrypoint.sh.
+  # Mounted over the clone's models/ dir only, so the code baked into the image
+  # stays visible. Survives redeploys; re-downloaded if the instance is replaced.
+  volume {
+    name      = "musetalk-models"
+    host_path = "/opt/avatar/musetalk_models"
+  }
 
   container_definitions = jsonencode([{
     name         = "backend"
     image        = local.backend_image
     essential    = true
     portMappings = [{ containerPort = 8000, protocol = "tcp" }]
+    mountPoints = [
+      { sourceVolume = "voice-profiles", containerPath = "/app/voice_profiles", readOnly = false },
+      { sourceVolume = "musetalk-models", containerPath = "/app/models/MuseTalk/models", readOnly = false },
+    ]
     environment  = local.backend_env
     secrets      = local.backend_secrets
     # One whole GPU. ECS has no fractional GPU allocation, which is why the
@@ -603,6 +663,8 @@ resource "aws_ecs_service" "backend" {
   # task releases the device.
   deployment_minimum_healthy_percent = 0
   deployment_maximum_percent         = 100
+
+  enable_execute_command = true
 
   depends_on = [aws_lb_listener.http, aws_iam_role_policy.task_execution_secrets]
 

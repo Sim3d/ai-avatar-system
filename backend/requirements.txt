@@ -104,6 +104,7 @@ ffmpeg-python==0.2.0
 
 # Celery
 celery==5.3.6
+kombu==5.3.7  # pinned: newer kombu requires redis-py >= 6.1.0, incompatible with redis==5.0.1
 flower==2.0.1
 
 # Monitoring & Logging

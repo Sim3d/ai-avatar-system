@@ -28,6 +28,13 @@ import sys
 import traceback
 from typing import Any, List
 
+# stdout is the parent<->worker protocol channel, but upstream MuseTalk and
+# its helpers print() diagnostics (e.g. "load unet model from ..."). Keep a
+# private handle for protocol messages and route every other print to stderr,
+# which the parent captures to worker_stderr.log.
+_PROTOCOL_OUT = sys.stdout
+sys.stdout = sys.stderr
+
 import cv2
 import numpy as np
 import torch
@@ -46,8 +53,8 @@ AUDIO_PAD_R = 2
 
 
 def _reply(obj: dict):
-    sys.stdout.write(json.dumps(obj) + "\n")
-    sys.stdout.flush()
+    _PROTOCOL_OUT.write(json.dumps(obj) + "\n")
+    _PROTOCOL_OUT.flush()
 
 
 def _load_face_restorer(mode: str, model_path: str, device):
@@ -263,8 +270,8 @@ def main():
         init.get("face_restore", "off"), init.get("face_restore_model", ""), device
     )
 
-    sys.stdout.write("READY\n")
-    sys.stdout.flush()
+    _PROTOCOL_OUT.write("READY\n")
+    _PROTOCOL_OUT.flush()
 
     # ── job loop ──────────────────────────────────────────────────────────────
     for raw in sys.stdin:
@@ -277,9 +284,11 @@ def main():
             continue
         try:
             _run_job(job, vae, unet, pe, audio_processor, whisper, fp, timesteps, device, restorer)
-            _reply({"status": "ok", "output": job["output"]})
+            _reply({"id": job.get("id"), "status": "ok", "output": job["output"]})
         except Exception as e:
-            _reply({"status": "error", "msg": str(e), "tb": traceback.format_exc()})
+            _reply(
+                {"id": job.get("id"), "status": "error", "msg": str(e), "tb": traceback.format_exc()}
+            )
 
 
 if __name__ == "__main__":
