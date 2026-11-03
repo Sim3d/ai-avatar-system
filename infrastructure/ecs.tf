@@ -576,6 +576,10 @@ resource "aws_lb_target_group" "frontend" {
     healthy_threshold   = 2
     unhealthy_threshold = 5
   }
+
+  # A draining task keeps its ENI; with the 4-ENI g5.xlarge limit the 300 s
+  # default blocked the backend from being placed during a rollout.
+  deregistration_delay = 10
 }
 
 resource "aws_lb_listener" "http" {
@@ -696,6 +700,12 @@ resource "aws_ecs_service" "frontend" {
     container_port   = 3000
   }
 
+  # Every awsvpc task takes an ENI and a g5.xlarge only has 4 (one is the
+  # host's). Starting a replacement before stopping the old task would steal
+  # the ENI the backend needs, leaving it stuck in PROVISIONING.
+  deployment_minimum_healthy_percent = 0
+  deployment_maximum_percent         = 100
+
   depends_on = [aws_lb_listener.http]
 
   lifecycle {
@@ -720,6 +730,10 @@ resource "aws_ecs_service" "worker" {
   }
 
   # No load balancer: the worker consumes from Redis and serves no traffic.
+
+  # Same 4-ENI budget as the frontend: never run old and new side by side.
+  deployment_minimum_healthy_percent = 0
+  deployment_maximum_percent         = 100
 
   lifecycle {
     ignore_changes = [task_definition]
