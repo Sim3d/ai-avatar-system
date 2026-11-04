@@ -52,6 +52,8 @@ _default_conds = None
 # Chatterbox's default 0.8 sampling makes cloned voices stutter/repeat words;
 # a lower temperature keeps the voice but stabilises the token stream.
 _TEMPERATURE = float(os.getenv("TTS_TEMPERATURE", "0.6"))
+_MAX_SEC_PER_CHAR = float(os.getenv("TTS_MAX_SEC_PER_CHAR", "0.075"))
+_MIN_CHECK_SECONDS = 1.5
 
 
 def _device() -> str:
@@ -122,9 +124,29 @@ def _use_speaker(key: Optional[str], data: Optional[bytes]) -> None:
     _model.conds = conds
 
 
+def _max_plausible_seconds(text: str) -> float:
+    """Longest believable duration for `text`; beyond it the model looped.
+
+    Chatterbox sometimes finishes the sentence and starts it over in the same
+    clip ("How can I help you today? How can I help you today?"). Measured
+    clean speech is ~0.05-0.065 s/char; a doubled sentence is ~0.1 s/char.
+    """
+    return max(_MIN_CHECK_SECONDS, 0.3 + _MAX_SEC_PER_CHAR * len(text))
+
+
 def _generate(text: str, language: str, key: Optional[str], data: Optional[bytes]):
     _use_speaker(key, data)
-    return _model.generate(text, language_id=language, temperature=_TEMPERATURE)
+    wav = _model.generate(text, language_id=language, temperature=_TEMPERATURE)
+    limit = _max_plausible_seconds(text)
+    seconds = wav.shape[-1] / _model.sr
+    if seconds <= limit:
+        return wav
+    logger.warning(
+        f"Audio {seconds:.2f}s exceeds {limit:.2f}s for {len(text)} chars "
+        "(likely repetition); regenerating"
+    )
+    retry = _model.generate(text, language_id=language, temperature=_TEMPERATURE)
+    return retry if retry.shape[-1] < wav.shape[-1] else wav
 
 
 @app.post("/synthesize")

@@ -931,16 +931,18 @@ class ConnectionManager:
         # Two-stage pipeline: TTS for sentence N+1 runs while sentence N is
         # being animated, so the gap between clips is max(TTS, animation)
         # instead of TTS + animation.
-        audio_queue: "asyncio.Queue[Optional[tuple[str, Path]]]" = asyncio.Queue(maxsize=2)
-        # TTS and MuseTalk share one GPU: running sentence 2's TTS during
-        # sentence 1's UNet doubled the time to first speech. Hold the next
-        # TTS until the first clip's GPU phase is over (blend/encode is CPU).
-        first_clip_gpu_free = asyncio.Event()
+        audio_queue: "asyncio.Queue[Optional[tuple[str, Path, asyncio.Event]]]" = asyncio.Queue(
+            maxsize=2
+        )
+        # TTS and MuseTalk share one GPU: running TTS during a clip's UNet
+        # slowed both (UNet 1.5s -> 3.4s). Each queued clip carries an event
+        # set when its GPU phase ends (blend/encode is CPU); the next TTS
+        # waits for it so the GPU only ever runs one job.
 
         async def synthesize_stage() -> None:
             nonlocal fallback_announced
             sentence: Optional[str] = ""
-            queued_first = False
+            prev_gpu_free: Optional[asyncio.Event] = None
             try:
                 while True:
                     sentence = await queue.get()
@@ -949,9 +951,9 @@ class ConnectionManager:
                     if not speakable_text(sentence):
                         continue  # emoji-only chunk — nothing to say or animate
 
-                    if queued_first and not first_clip_gpu_free.is_set():
+                    if prev_gpu_free is not None and not prev_gpu_free.is_set():
                         try:
-                            await asyncio.wait_for(first_clip_gpu_free.wait(), timeout=15)
+                            await asyncio.wait_for(prev_gpu_free.wait(), timeout=15)
                         except asyncio.TimeoutError:
                             pass
 
@@ -998,8 +1000,8 @@ class ConnectionManager:
                             },
                         )
 
-                    await audio_queue.put((sentence, tmp_audio))
-                    queued_first = True
+                    prev_gpu_free = asyncio.Event()
+                    await audio_queue.put((sentence, tmp_audio, prev_gpu_free))
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -1017,7 +1019,7 @@ class ConnectionManager:
                 item = await audio_queue.get()
                 if item is None:
                     break
-                sentence, tmp_audio = item
+                sentence, tmp_audio, gpu_free = item
                 tmp_video = tmp_audio.with_name(tmp_audio.name.replace("_audio.wav", "_video.mp4"))
 
                 if session_id not in self.active_connections:
@@ -1039,7 +1041,7 @@ class ConnectionManager:
                             avatar_image_path=avatar_image,
                             audio_path=str(tmp_audio),
                             output_path=str(tmp_video),
-                            on_gpu_done=first_clip_gpu_free.set,
+                            on_gpu_done=gpu_free.set,
                         )
 
                     ts = int(datetime.now(timezone.utc).timestamp() * 1000)
@@ -1070,7 +1072,7 @@ class ConnectionManager:
                     logger.error(f"Chunk {chunk_index} failed [{session_id}]: {e}")
 
                 finally:
-                    first_clip_gpu_free.set()
+                    gpu_free.set()
                     tmp_audio.unlink(missing_ok=True)
                     tmp_video.unlink(missing_ok=True)
 
