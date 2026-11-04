@@ -52,7 +52,10 @@ _default_conds = None
 # Chatterbox's default 0.8 sampling makes cloned voices stutter/repeat words;
 # a lower temperature keeps the voice but stabilises the token stream.
 _TEMPERATURE = float(os.getenv("TTS_TEMPERATURE", "0.6"))
-_MAX_SEC_PER_CHAR = float(os.getenv("TTS_MAX_SEC_PER_CHAR", "0.075"))
+# Cloned voices speak at up to ~0.09 s/char, so a tighter limit regenerated
+# clean sentences and doubled the gap between clips. This only has to catch
+# whole-sentence loops (~2x); doubled words are the ASR verifier's job.
+_MAX_SEC_PER_CHAR = float(os.getenv("TTS_MAX_SEC_PER_CHAR", "0.13"))
 _MIN_CHECK_SECONDS = 1.5
 
 
@@ -129,7 +132,7 @@ def _max_plausible_seconds(text: str) -> float:
 
     Chatterbox sometimes finishes the sentence and starts it over in the same
     clip ("How can I help you today? How can I help you today?"). Measured
-    clean speech is ~0.05-0.065 s/char; a doubled sentence is ~0.1 s/char.
+    clean speech is ~0.05-0.09 s/char; a doubled sentence is roughly twice that.
     """
     return max(_MIN_CHECK_SECONDS, 0.3 + _MAX_SEC_PER_CHAR * len(text))
 

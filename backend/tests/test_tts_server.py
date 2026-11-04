@@ -33,7 +33,7 @@ def fake(monkeypatch):
     return install
 
 
-TEXT = "How can I help you today?"  # 25 chars -> limit ~2.2s
+TEXT = "How can I help you today?"  # 25 chars -> limit ~3.55s
 
 
 def test_normal_audio_is_returned_without_retry(fake):
@@ -44,16 +44,22 @@ def test_normal_audio_is_returned_without_retry(fake):
 
 
 def test_looping_audio_is_regenerated_and_shorter_kept(fake):
-    model = fake(2.52, 1.25)
+    model = fake(4.2, 1.25)
     wav = tts_server._generate(TEXT, "en", None, None)
     assert model.calls == 2
     assert wav.shape[-1] == int(1.25 * SR)
 
 
 def test_retry_keeps_first_when_retry_is_longer(fake):
-    fake(2.52, 3.0)
+    fake(4.2, 5.0)
     wav = tts_server._generate(TEXT, "en", None, None)
-    assert wav.shape[-1] == int(2.52 * SR)
+    assert wav.shape[-1] == int(4.2 * SR)
+
+
+def test_slow_cloned_voice_is_not_regenerated(fake):
+    model = fake(2.6)
+    tts_server._generate(TEXT, "en", None, None)
+    assert model.calls == 1
 
 
 def test_short_text_has_duration_floor(fake):

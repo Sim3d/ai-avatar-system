@@ -1,5 +1,6 @@
 from unittest.mock import AsyncMock
 
+import numpy as np
 import pytest
 
 from app.services import tts_verify
@@ -58,3 +59,58 @@ async def test_verifier_failure_keeps_the_audio(monkeypatch, tmp_path):
     monkeypatch.setattr(tts_verify, "_transcribe", lambda *_: (_ for _ in ()).throw(OSError("x")))
 
     assert await tts_verify.sounds_repeated(str(out), "Hello", "en") is False
+
+
+SR = 16000
+
+
+def _clip(*parts):
+    """Build audio from (seconds, amplitude) runs of a 200 Hz tone."""
+    chunks = []
+    for seconds, amp in parts:
+        t = np.arange(int(seconds * SR)) / SR
+        chunks.append((amp * np.sin(2 * np.pi * 200 * t)).astype(np.float32))
+    return np.concatenate(chunks)
+
+
+def _write(path, samples):
+    import soundfile as sf
+
+    sf.write(str(path), samples, SR)
+
+
+def test_clipped_repeat_after_last_word_is_trimmed(monkeypatch, tmp_path):
+    sf = pytest.importorskip("soundfile")
+    # Pattern of a real clip: "...today?" ends at 1.3s, silence, then a clipped "today".
+    out = tmp_path / "out.wav"
+    _write(out, _clip((1.3, 0.2), (0.6, 0.0), (0.3, 0.2)))
+    monkeypatch.setattr(
+        tts_verify, "_transcribe", lambda *_: (" How are you doing today?", 1.3)
+    )
+
+    assert tts_verify._verify(str(out), "How are you doing today?", "en") is False
+
+    trimmed, _ = sf.read(str(out))
+    assert len(trimmed) / SR == pytest.approx(1.45, abs=0.01)
+
+
+def test_clean_clip_is_not_trimmed(monkeypatch, tmp_path):
+    sf = pytest.importorskip("soundfile")
+    out = tmp_path / "out.wav"
+    _write(out, _clip((1.3, 0.2), (0.8, 0.0)))
+    monkeypatch.setattr(tts_verify, "_transcribe", lambda *_: (" Hi there.", 1.3))
+
+    tts_verify._verify(str(out), "Hi there.", "en")
+
+    assert len(sf.read(str(out))[0]) == int(2.1 * SR)
+
+
+def test_tail_is_kept_when_whisper_missed_the_last_word(monkeypatch, tmp_path):
+    sf = pytest.importorskip("soundfile")
+    out = tmp_path / "out.wav"
+    _write(out, _clip((1.0, 0.2), (0.4, 0.0), (0.5, 0.2)))
+    monkeypatch.setattr(tts_verify, "_transcribe", lambda *_: (" Hi there, great", 1.0))
+
+    tts_verify._verify(str(out), "Hi there, great to meet you.", "en")
+
+    assert len(sf.read(str(out))[0]) == int(1.9 * SR)
