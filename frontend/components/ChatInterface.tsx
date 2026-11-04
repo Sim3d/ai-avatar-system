@@ -213,6 +213,12 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
   // the empty (black) frame a single <video> displays while a new src loads.
   const videoARef = useRef<HTMLVideoElement>(null)
   const videoBRef = useRef<HTMLVideoElement>(null)
+  // Frames are copied onto this canvas, which sits above both players. A
+  // canvas keeps its last drawn image, so a clip swap can never surface the
+  // black layer Chrome/Edge (Windows video overlays) briefly show when the
+  // stacking of two <video> elements changes.
+  const canvasRef = useRef<HTMLCanvasElement>(null)
+  const lastPaintRef = useRef<{ video: HTMLVideoElement | null; time: number }>({ video: null, time: -1 })
   const swapTokenRef = useRef(0)
   const activeSlotRef = useRef<0 | 1>(0)
   // True between play() on the standby player and its first frame; preloading
@@ -274,6 +280,32 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
     return { active, standby }
   }, [])
 
+  const paintActive = useCallback(() => {
+    const canvas = canvasRef.current
+    const { active } = getPlayers()
+    // readyState < HAVE_CURRENT_DATA: nothing decoded yet, keep the last image.
+    if (!canvas || !active || active.readyState < 2) return
+    const last = lastPaintRef.current
+    if (last.video === active && last.time === active.currentTime) return
+    const w = active.videoWidth
+    const h = active.videoHeight
+    if (!w || !h) return
+    if (canvas.width !== w) canvas.width = w
+    if (canvas.height !== h) canvas.height = h
+    canvas.getContext('2d')?.drawImage(active, 0, 0, w, h)
+    lastPaintRef.current = { video: active, time: active.currentTime }
+  }, [getPlayers])
+
+  useEffect(() => {
+    let raf = 0
+    const loop = () => {
+      paintActive()
+      raf = requestAnimationFrame(loop)
+    }
+    raf = requestAnimationFrame(loop)
+    return () => cancelAnimationFrame(raf)
+  }, [paintActive])
+
   const preloadUpcoming = useCallback(() => {
     const upcoming = chunkQueueRef.current[0]
     const { standby } = getPlayers()
@@ -288,6 +320,9 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
     for (const video of [videoARef.current, videoBRef.current]) {
       if (video) { video.pause(); video.removeAttribute('src'); video.load() }
     }
+    const canvas = canvasRef.current
+    canvas?.getContext('2d')?.clearRect(0, 0, canvas.width, canvas.height)
+    lastPaintRef.current = { video: null, time: -1 }
   }, [])
 
   const playNextChunk = useCallback(() => {
@@ -327,6 +362,7 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
           previous.style.zIndex = '1'
           previous.pause()
         }
+        paintActive()
         setShowVideo(true)
         preloadUpcoming()
       })
@@ -338,7 +374,7 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
         if (chunkQueueRef.current.length > 0) playNextChunk()
         else { isPlayingRef.current = false; setShowVideo(false) }
       })
-  }, [isMuted, getPlayers, preloadUpcoming])
+  }, [isMuted, getPlayers, preloadUpcoming, paintActive])
 
   // Attach ended + error handlers to both players; only the visible one drives
   // the queue (a failed preload surfaces later as a rejected play()). The
@@ -1031,6 +1067,12 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
                 playsInline
                 preload="auto"
                 muted
+              />
+              <canvas
+                ref={canvasRef}
+                aria-hidden
+                className="absolute inset-0 w-full h-full object-cover"
+                style={{ zIndex: 3 }}
               />
             </div>
 
