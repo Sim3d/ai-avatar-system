@@ -53,21 +53,25 @@ class _FakeStdin:
 
 
 class _FakeStdout:
-    def __init__(self, stdin: _FakeStdin, stale: list):
+    def __init__(self, stdin: _FakeStdin, stale: list, progress: bool = False):
         self._stdin = stdin
         self._lines = [json.dumps(s).encode() + b"\n" for s in stale]
+        self._progress = progress
 
     async def readline(self):
         if self._lines:
             return self._lines.pop(0)
         job = self._stdin.jobs[-1]
+        if self._progress:
+            self._progress = False
+            return json.dumps({"id": job["id"], "status": "gpu_done"}).encode() + b"\n"
         return json.dumps({"id": job["id"], "status": "ok", "output": job["output"]}).encode() + b"\n"
 
 
 class _FakeProc:
-    def __init__(self, stale):
+    def __init__(self, stale, progress: bool = False):
         self.stdin = _FakeStdin()
-        self.stdout = _FakeStdout(self.stdin, stale)
+        self.stdout = _FakeStdout(self.stdin, stale, progress)
 
     def kill(self):
         pass
@@ -87,3 +91,24 @@ def test_worker_infer_discards_stale_replies(tmp_path):
         animator._worker_infer(str(tmp_path / "a.jpg"), str(tmp_path / "a.wav"), str(out), None)
     )
     assert result == str(out)
+
+
+def test_worker_infer_reports_gpu_done_before_result(tmp_path):
+    """The worker's gpu_done progress line fires the callback and is not taken as the result."""
+    animator = AvatarAnimator()
+    proc = _FakeProc(stale=[], progress=True)
+    calls = []
+
+    async def fake_ensure():
+        return proc
+
+    animator._ensure_worker = fake_ensure  # type: ignore[method-assign]
+    out = tmp_path / "out.mp4"
+    result = asyncio.run(
+        animator._worker_infer(
+            str(tmp_path / "a.jpg"), str(tmp_path / "a.wav"), str(out), None,
+            on_gpu_done=lambda: calls.append(1),
+        )
+    )
+    assert result == str(out)
+    assert calls == [1]

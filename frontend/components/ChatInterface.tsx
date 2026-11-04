@@ -208,6 +208,7 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
   // the empty (black) frame a single <video> displays while a new src loads.
   const videoARef = useRef<HTMLVideoElement>(null)
   const videoBRef = useRef<HTMLVideoElement>(null)
+  const swapTokenRef = useRef(0)
   const activeSlotRef = useRef<0 | 1>(0)
   // True between play() on the standby player and its first frame; preloading
   // into the standby player then would replace the clip being started.
@@ -249,6 +250,19 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
   }, [avatarId])
 
   // ── Chunk queue player ───────────────────────────────────────────────────
+  // play() resolving only means playback started: Chrome can still show an
+  // empty (black) video layer for a frame or two, so wait for a frame to
+  // actually be presented before raising the player.
+  const firstFramePainted = (video: HTMLVideoElement) => new Promise<void>((resolve) => {
+    const timer = window.setTimeout(resolve, 300)
+    const done = () => { window.clearTimeout(timer); resolve() }
+    const rvfc = (video as HTMLVideoElement & {
+      requestVideoFrameCallback?: (cb: () => void) => number
+    }).requestVideoFrameCallback
+    if (rvfc) rvfc.call(video, () => requestAnimationFrame(done))
+    else requestAnimationFrame(() => requestAnimationFrame(done))
+  })
+
   const getPlayers = useCallback(() => {
     const active = activeSlotRef.current === 0 ? videoARef.current : videoBRef.current
     const standby = activeSlotRef.current === 0 ? videoBRef.current : videoARef.current
@@ -264,6 +278,7 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
   }, [getPlayers])
 
   const clearVideos = useCallback(() => {
+    swapTokenRef.current++
     switchingRef.current = false
     for (const video of [videoARef.current, videoBRef.current]) {
       if (video) { video.pause(); video.removeAttribute('src'); video.load() }
@@ -290,14 +305,19 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
     // element that's ALREADY playing needs no fresh gesture, so we restore
     // the user's mute choice right after play() resolves.
     video.muted = true
+    const token = ++swapTokenRef.current
     video.play()
       .then(() => {
-        // Raise the new clip only now that it has a frame; until then the
-        // previous clip's last frame stays on screen.
+        video.muted = isMuted
+        return firstFramePainted(video)
+      })
+      .then(() => {
+        if (token !== swapTokenRef.current) return  // cleared meanwhile
+        // Raise the new clip only once a frame is on screen; until then the
+        // previous clip's last frame stays visible.
         switchingRef.current = false
         activeSlotRef.current = activeSlotRef.current === 0 ? 1 : 0
         video.style.zIndex = '2'
-        video.muted = isMuted
         if (previous) {
           previous.style.zIndex = '1'
           previous.pause()
@@ -308,6 +328,7 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
       // A rejected play() (decode error, bad clip) must not strand the
       // queue — skip to the next chunk so playback can't hang on one bad clip.
       .catch(() => {
+        if (token !== swapTokenRef.current) return
         switchingRef.current = false
         if (chunkQueueRef.current.length > 0) playNextChunk()
         else { isPlayingRef.current = false; setShowVideo(false) }

@@ -8,7 +8,7 @@ import tempfile
 import uuid
 import wave
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 
@@ -325,9 +325,18 @@ class AvatarAnimator:
         return proc
 
     async def _worker_infer(
-        self, image_path: str, audio_path: str, output_path: str, coord_cache: Optional[str]
+        self,
+        image_path: str,
+        audio_path: str,
+        output_path: str,
+        coord_cache: Optional[str],
+        on_gpu_done: Optional[Callable[[], None]] = None,
     ) -> str:
-        """Send one job to the persistent worker and await its result."""
+        """Send one job to the persistent worker and await its result.
+
+        on_gpu_done fires when the worker reports its GPU phase is over (the
+        remaining blend/encode is CPU-only), before the final result.
+        """
         async with self._worker_lock:
             proc = await self._ensure_worker()
 
@@ -388,6 +397,10 @@ class AvatarAnimator:
                 if result.get("id") != job_id:
                     logger.warning(f"Discarding stale MuseTalk reply for job {result.get('id')}")
                     continue
+                if result.get("status") == "gpu_done":
+                    if on_gpu_done is not None:
+                        on_gpu_done()
+                    continue
                 break
 
             if result["status"] != "ok":
@@ -411,10 +424,14 @@ class AvatarAnimator:
         audio_path: str,
         output_path: str,
         cache_key: Optional[str] = None,
+        on_gpu_done: Optional[Callable[[], None]] = None,
     ) -> str:
         """
         Animate avatar with audio. Returns path to the generated video.
         Falls back to simple (static image + audio) on any engine failure.
+
+        on_gpu_done may fire before return once the GPU work is finished
+        (MuseTalk only); other engines never call it.
         """
         if not self._initialised:
             await self.initialize()
@@ -426,7 +443,9 @@ class AvatarAnimator:
             if self.engine == "musetalk" and not self._musetalk_weights_ready():
                 return await self._animate_simple(avatar_image_path, audio_path, output_path)
             if self.engine == "musetalk":
-                return await self._animate_musetalk(avatar_image_path, audio_path, output_path)
+                return await self._animate_musetalk(
+                    avatar_image_path, audio_path, output_path, on_gpu_done
+                )
             elif self.engine == "liveavatar":
                 return await self._animate_liveavatar(avatar_image_path, audio_path, output_path)
             else:
@@ -442,6 +461,7 @@ class AvatarAnimator:
         avatar_path: str,
         audio_path: str,
         output_path: str,
+        on_gpu_done: Optional[Callable[[], None]] = None,
     ) -> str:
         """Run MuseTalk via persistent worker (models stay loaded between calls)."""
         musetalk_dir: Path = self._musetalk_dir  # type: ignore[assignment]
@@ -452,7 +472,7 @@ class AvatarAnimator:
         coord_cache = str(musetalk_dir / "results" / "coords" / f"{avatar_id}.v2.pkl")
         os.makedirs(os.path.dirname(coord_cache), exist_ok=True)
 
-        await self._worker_infer(avatar_path, audio_path, output_path, coord_cache)
+        await self._worker_infer(avatar_path, audio_path, output_path, coord_cache, on_gpu_done)
 
         logger.info(f"MuseTalk animation done: {output_path}")
         return output_path

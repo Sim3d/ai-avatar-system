@@ -932,10 +932,15 @@ class ConnectionManager:
         # being animated, so the gap between clips is max(TTS, animation)
         # instead of TTS + animation.
         audio_queue: "asyncio.Queue[Optional[tuple[str, Path]]]" = asyncio.Queue(maxsize=2)
+        # TTS and MuseTalk share one GPU: running sentence 2's TTS during
+        # sentence 1's UNet doubled the time to first speech. Hold the next
+        # TTS until the first clip's GPU phase is over (blend/encode is CPU).
+        first_clip_gpu_free = asyncio.Event()
 
         async def synthesize_stage() -> None:
             nonlocal fallback_announced
             sentence: Optional[str] = ""
+            queued_first = False
             try:
                 while True:
                     sentence = await queue.get()
@@ -943,6 +948,12 @@ class ConnectionManager:
                         break
                     if not speakable_text(sentence):
                         continue  # emoji-only chunk — nothing to say or animate
+
+                    if queued_first and not first_clip_gpu_free.is_set():
+                        try:
+                            await asyncio.wait_for(first_clip_gpu_free.wait(), timeout=15)
+                        except asyncio.TimeoutError:
+                            pass
 
                     tmp_audio = session_dir / f"{uuid.uuid4().hex[:12]}_audio.wav"
                     try:
@@ -988,6 +999,7 @@ class ConnectionManager:
                         )
 
                     await audio_queue.put((sentence, tmp_audio))
+                    queued_first = True
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -1027,6 +1039,7 @@ class ConnectionManager:
                             avatar_image_path=avatar_image,
                             audio_path=str(tmp_audio),
                             output_path=str(tmp_video),
+                            on_gpu_done=first_clip_gpu_free.set,
                         )
 
                     ts = int(datetime.now(timezone.utc).timestamp() * 1000)
@@ -1057,6 +1070,7 @@ class ConnectionManager:
                     logger.error(f"Chunk {chunk_index} failed [{session_id}]: {e}")
 
                 finally:
+                    first_clip_gpu_free.set()
                     tmp_audio.unlink(missing_ok=True)
                     tmp_video.unlink(missing_ok=True)
 

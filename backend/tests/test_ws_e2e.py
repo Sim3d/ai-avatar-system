@@ -89,7 +89,7 @@ async def test_ws_full_turn_streams_events(monkeypatch):
             output_path=output_path, engine="chatterbox", fallback=False, voice_cloned=False
         )
 
-    async def fake_animate(avatar_image_path, audio_path, output_path):
+    async def fake_animate(avatar_image_path, audio_path, output_path, on_gpu_done=None):
         from pathlib import Path
 
         Path(output_path).write_bytes(b"mp4")

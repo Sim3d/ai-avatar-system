@@ -259,6 +259,10 @@ def _run_job(job, vae, unet, pe, audio_processor, whisper, fp, timesteps, device
         torch.cuda.synchronize()
     timings["unet"] = time.perf_counter() - t0
     t0 = time.perf_counter()
+    # The rest is CPU-only unless face restoration runs on the GPU; tell the
+    # backend so it can start the next sentence's TTS without contending.
+    if restorer is None:
+        _reply({"id": job.get("id"), "status": "gpu_done"})
 
     # ── blend back, streamed straight into one ffmpeg pass (video + audio) ──
     height, width = frame_list_cycle[0].shape[:2]
