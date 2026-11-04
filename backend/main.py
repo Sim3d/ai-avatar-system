@@ -23,6 +23,7 @@ from app.services.animator import avatar_animator
 from app.services.cache import cache_service
 from app.services.llm import llm_service
 from app.services.storage import storage_service
+from app.services import tts_verify
 from app.telemetry import init_telemetry
 from app.tokens import subject_from_token
 from app.websocket import websocket_manager
@@ -91,6 +92,7 @@ async def lifespan(app: FastAPI):
     websocket_manager.start_cleanup_task()
     # Background: the first turn after a deploy must not pay model loading.
     prewarm_task = asyncio.create_task(avatar_animator.prewarm())
+    verify_prewarm_task = asyncio.create_task(tts_verify.prewarm())
     logger.info("AI Avatar System started successfully")
 
     yield
@@ -98,6 +100,7 @@ async def lifespan(app: FastAPI):
     # Cleanup
     logger.info("Shutting down AI Avatar System...")
     prewarm_task.cancel()
+    verify_prewarm_task.cancel()
     await websocket_manager.stop_cleanup_task()
     await llm_service.close()
     await storage_service.cleanup()

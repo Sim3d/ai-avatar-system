@@ -33,6 +33,7 @@ import torch
 import torchaudio
 
 from app.config import settings
+from app.services import tts_verify
 
 logger = logging.getLogger(__name__)
 
@@ -233,6 +234,8 @@ class TTSService:
 
             if settings.CHATTERBOX_URL:
                 await self._remote_chatterbox(text, output_path, speaker_wav, language)
+                if await tts_verify.sounds_repeated(output_path, text, language):
+                    await self._remote_chatterbox(text, output_path, speaker_wav, language)
                 return SynthResult(
                     output_path=output_path,
                     engine="chatterbox",

@@ -136,6 +136,8 @@ class Settings(BaseSettings):
     # When set, Chatterbox is called over HTTP instead of imported in-process.
     CHATTERBOX_URL: Optional[str] = None
     CHATTERBOX_TIMEOUT: float = 120.0
+    # Whisper size used on CPU to listen back for Chatterbox loops ("" = off).
+    TTS_VERIFY_MODEL: str = "tiny"
 
     # Security
     # Union[..., str] lets pydantic-settings keep a non-JSON env value as a
