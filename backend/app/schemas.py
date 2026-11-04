@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Annotated, Any, Dict, List, Optional
 
 from pydantic import BaseModel, EmailStr, Field, field_validator
 
@@ -157,6 +157,12 @@ class AvatarMetadataUpdate(BaseModel):
     system_prompt: Optional[str] = Field(default=None, max_length=8000)
     personality: Optional[str] = Field(default=None, max_length=2000)
     role: Optional[str] = Field(default=None, max_length=100)
+    # Short expertise tags shown as chips under the avatar's role.
+    specialties: Optional[List[Annotated[str, Field(min_length=1, max_length=60)]]] = Field(
+        default=None, max_length=3
+    )
+    # Short spoken introduction (~10-15 s) telling users what to ask this avatar.
+    description: Optional[str] = Field(default=None, max_length=600)
     background_color: Optional[str] = Field(default=None, max_length=32)
     animation_style: Optional[str] = Field(default=None, max_length=32)
 

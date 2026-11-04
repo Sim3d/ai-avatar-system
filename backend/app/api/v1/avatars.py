@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import tempfile
 import uuid
@@ -5,6 +6,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
+from fastapi.responses import Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -13,6 +15,7 @@ from app.config import settings
 from app.database import get_db
 from app.models import Avatar, User
 from app.schemas import AvatarMetadataUpdate, AvatarRename, AvatarResponse
+from app.services import avatar_intro
 from app.services.avatar_processor import avatar_processor
 from app.services.storage import storage_service
 from app.uploads import read_capped
@@ -20,6 +23,8 @@ from app.uploads import read_capped
 logger = logging.getLogger(__name__)
 router = APIRouter()
 TMPDIR = Path(tempfile.gettempdir())
+# Strong refs so fire-and-forget intro warm-ups aren't garbage-collected mid-run.
+_background_tasks: set[asyncio.Task] = set()
 
 
 def _validate_uuid(avatar_id: str) -> None:
@@ -245,11 +250,57 @@ async def update_avatar_metadata(
         await db.commit()
         await db.refresh(avatar)
         logger.info(f"Avatar {avatar_id} metadata updated: {list(update_data.keys())}")
-        return avatar
     except Exception as e:
         await db.rollback()
         logger.error(f"Failed to update metadata for avatar {avatar_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to update avatar metadata")
+
+    description = avatar_intro.intro_description(avatar)
+    if "description" in update_data and description:
+        task = asyncio.create_task(
+            avatar_intro.prewarm_intro(avatar.id, description, avatar.voice_id)
+        )
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
+    return avatar
+
+
+@router.get(
+    "/{avatar_id}/intro",
+    response_class=Response,
+    responses={200: {"content": {"audio/wav": {}}}},
+)
+async def get_avatar_intro(
+    avatar_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_current_user),
+):
+    """Short pre-recorded WAV where the avatar introduces itself in its own voice."""
+    _validate_uuid(avatar_id)
+    result = await db.execute(select(Avatar).where(Avatar.id == avatar_id))
+    avatar = result.scalar_one_or_none()
+    if not avatar:
+        raise HTTPException(status_code=404, detail="Avatar not found")
+    if avatar.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Not authorised to access this avatar")
+
+    description = avatar_intro.intro_description(avatar)
+    if not description:
+        raise HTTPException(status_code=404, detail="Avatar has no description")
+
+    try:
+        audio = await avatar_intro.get_intro_audio(avatar.id, description, avatar.voice_id)
+    except Exception as e:
+        logger.exception(f"Intro synthesis failed for avatar {avatar_id}")
+        raise HTTPException(status_code=500, detail=f"Synthesis failed: {e.__class__.__name__}")
+
+    # The URL is stable while the content depends on the description: let the
+    # browser keep it briefly but always revalidate.
+    return Response(
+        content=audio,
+        media_type="audio/wav",
+        headers={"Cache-Control": "private, no-cache"},
+    )
 
 
 @router.patch("/{avatar_id}/name", response_model=AvatarResponse)
