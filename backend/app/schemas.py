@@ -156,6 +156,7 @@ class AvatarMetadataUpdate(BaseModel):
 
     system_prompt: Optional[str] = Field(default=None, max_length=8000)
     personality: Optional[str] = Field(default=None, max_length=2000)
+    role: Optional[str] = Field(default=None, max_length=100)
     background_color: Optional[str] = Field(default=None, max_length=32)
     animation_style: Optional[str] = Field(default=None, max_length=32)
 
