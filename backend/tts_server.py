@@ -41,13 +41,21 @@ _SPEAKER_CACHE = Path(tempfile.gettempdir()) / "chatterbox-speakers"
 
 app = FastAPI(title="Chatterbox TTS")
 _model = None
-# One GPU, one model: serialize generation instead of interleaving it.
+# Chatterbox-Turbo: English only, no CFG and a 2-step decoder, so several
+# times faster than the multilingual model. It speaks English cloned voices;
+# everything else stays on the multilingual model. TTS_TURBO=0 disables it.
+_turbo = None
+_TURBO_ENABLED = os.getenv("TTS_TURBO", "1") != "0"
+# Turbo rejects reference clips of 5 s or less; those voices stay multilingual.
+_turbo_rejected: set = set()
+# One GPU: serialize generation instead of interleaving it.
 _generate_lock = asyncio.Lock()
-# Speaker conditionals (voice embedding + prompt tokens) per reference WAV.
-# Chatterbox recomputes them from the file on every generate() given a path,
-# which costs a few hundred ms per sentence; avatars reuse a handful of voices.
+# Speaker conditionals (voice embedding + prompt tokens) per model and
+# reference WAV. Chatterbox recomputes them from the file on every generate()
+# given a path, which costs a few hundred ms per sentence; avatars reuse a
+# handful of voices.
 _MAX_CACHED_SPEAKERS = 32
-_speaker_conds: "OrderedDict[str, object]" = OrderedDict()
+_speaker_conds: "OrderedDict[tuple, object]" = OrderedDict()
 _default_conds = None
 # Chatterbox's default 0.8 sampling makes cloned voices stutter/repeat words;
 # a lower temperature keeps the voice but stabilises the token stream.
@@ -86,8 +94,24 @@ async def _load_model() -> None:
     except Exception:
         logger.exception("Chatterbox warm-up failed (continuing)")
     model.conds = _default_conds
+    if _TURBO_ENABLED:
+        await _load_turbo(device)
     _model = model
-    logger.info(f"Chatterbox ready (sr={_model.sr})")
+    logger.info(f"Chatterbox ready (sr={_model.sr}, turbo={'on' if _turbo else 'off'})")
+
+
+async def _load_turbo(device: str) -> None:
+    global _turbo
+    try:
+        from chatterbox.tts_turbo import ChatterboxTurboTTS
+
+        turbo = await asyncio.to_thread(ChatterboxTurboTTS.from_pretrained, device=device)
+        t0 = time.perf_counter()
+        await asyncio.to_thread(turbo.generate, "Hello there.", temperature=_TEMPERATURE)
+        logger.info(f"Chatterbox-Turbo warm-up done in {time.perf_counter() - t0:.1f}s")
+        _turbo = turbo
+    except Exception:
+        logger.exception("Chatterbox-Turbo unavailable; using the multilingual model only")
 
 
 @app.get("/health")
@@ -106,25 +130,45 @@ def _cached_speaker(key: str, data: bytes) -> str:
     return str(path)
 
 
-def _use_speaker(key: Optional[str], data: Optional[bytes]) -> None:
-    """Point the model at a speaker's conditionals (default voice when key is None).
+def _use_speaker(model, key: Optional[str], data: Optional[bytes]) -> None:
+    """Point `model` at a speaker's conditionals (default voice when key is None).
 
     Must run under _generate_lock: model.conds is shared state, and leaving a
     cloned voice set would make the next default-voice request speak with it.
     """
     if key is None:
-        _model.conds = _default_conds
+        model.conds = _default_conds
         return
-    conds = _speaker_conds.get(key)
+    cache_key = (id(model), key)
+    conds = _speaker_conds.get(cache_key)
     if conds is None:
-        _model.prepare_conditionals(_cached_speaker(key, data))
-        conds = _model.conds
-        _speaker_conds[key] = conds
+        model.prepare_conditionals(_cached_speaker(key, data))
+        conds = model.conds
+        _speaker_conds[cache_key] = conds
         if len(_speaker_conds) > _MAX_CACHED_SPEAKERS:
             _speaker_conds.popitem(last=False)
     else:
-        _speaker_conds.move_to_end(key)
-    _model.conds = conds
+        _speaker_conds.move_to_end(cache_key)
+    model.conds = conds
+
+
+def _select_model(language: str, key: Optional[str], data: Optional[bytes]):
+    """Pick the model for this request and load the speaker into it."""
+    if _turbo is not None and key and language == "en" and key not in _turbo_rejected:
+        try:
+            _use_speaker(_turbo, key, data)
+            return _turbo
+        except AssertionError:
+            logger.warning("Reference audio too short for Turbo (>5 s needed); using multilingual")
+            _turbo_rejected.add(key)
+    _use_speaker(_model, key, data)
+    return _model
+
+
+def _synthesize_once(model, text: str, language: str):
+    if model is _turbo:
+        return model.generate(text, temperature=_TEMPERATURE)
+    return model.generate(text, language_id=language, temperature=_TEMPERATURE)
 
 
 def _max_plausible_seconds(text: str) -> float:
@@ -138,18 +182,20 @@ def _max_plausible_seconds(text: str) -> float:
 
 
 def _generate(text: str, language: str, key: Optional[str], data: Optional[bytes]):
-    _use_speaker(key, data)
-    wav = _model.generate(text, language_id=language, temperature=_TEMPERATURE)
+    """Return (wav, engine name)."""
+    model = _select_model(language, key, data)
+    engine = "turbo" if model is _turbo else "multilingual"
+    wav = _synthesize_once(model, text, language)
     limit = _max_plausible_seconds(text)
-    seconds = wav.shape[-1] / _model.sr
+    seconds = wav.shape[-1] / model.sr
     if seconds <= limit:
-        return wav
+        return wav, engine
     logger.warning(
         f"Audio {seconds:.2f}s exceeds {limit:.2f}s for {len(text)} chars "
         "(likely repetition); regenerating"
     )
-    retry = _model.generate(text, language_id=language, temperature=_TEMPERATURE)
-    return retry if retry.shape[-1] < wav.shape[-1] else wav
+    retry = _synthesize_once(model, text, language)
+    return (retry if retry.shape[-1] < wav.shape[-1] else wav), engine
 
 
 @app.post("/synthesize")
@@ -176,13 +222,13 @@ async def synthesize(
     async with _generate_lock:
         t0 = time.perf_counter()
         try:
-            wav = await asyncio.to_thread(_generate, text, language, key, data)
+            wav, engine = await asyncio.to_thread(_generate, text, language, key, data)
         except Exception as e:
             logger.exception("Synthesis failed")
             raise HTTPException(500, f"Synthesis failed: {e}") from e
         logger.info(
             f"Synthesized {len(text)} chars in {time.perf_counter() - t0:.2f}s "
-            f"(speaker={'clone' if key else 'default'})"
+            f"(speaker={'clone' if key else 'default'}, engine={engine})"
         )
 
     buf = io.BytesIO()
