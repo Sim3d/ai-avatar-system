@@ -128,6 +128,25 @@ def _restore(restorer, frame):
         return frame
 
 
+def _match_tone(generated, original):
+    """
+    Shift the generated face crop's colour onto the original crop's.
+
+    MuseTalk's VAE re-renders the lower face with a slightly different skin
+    tone, which shows as a visible patch while talking that vanishes when the
+    idle image comes back. Only the lower half is compared (that is what the
+    jaw mask pastes back), and the median per-pixel LAB difference is used so
+    the open mouth and teeth, a minority of pixels, don't skew the offset.
+    """
+    half = generated.shape[0] // 2
+    gen_lab = cv2.cvtColor(generated, cv2.COLOR_BGR2LAB).astype(np.int16)
+    ori_lab = cv2.cvtColor(original, cv2.COLOR_BGR2LAB).astype(np.int16)
+    diff = ori_lab[half:] - gen_lab[half:]
+    offset = np.median(diff.reshape(-1, 3), axis=0).astype(np.int16)
+    shifted = np.clip(gen_lab + offset, 0, 255).astype(np.uint8)
+    return cv2.cvtColor(shifted, cv2.COLOR_LAB2BGR)
+
+
 def _prepare_blend_mask(image, face_box, fp, mode="jaw", upper_boundary_ratio=0.5, expand=1.5):
     """
     The blend mask of upstream `get_image`, computed once instead of per frame.
@@ -249,7 +268,11 @@ def _run_job(job, vae, unet, pe, audio_processor, whisper, fp, timesteps, device
             "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{width}x{height}", "-r", str(FPS),
             "-i", "-",
             "-i", audio_path,
-            "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p",
+            # Encode and tag BT.709 explicitly: untagged output is converted
+            # with BT.601 but decoded by browsers as BT.709, shifting the
+            # colours of the whole clip away from the idle image.
+            "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2:out_color_matrix=bt709:out_range=tv,format=yuv420p",
+            "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709", "-color_range", "tv",
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
             "-c:a", "aac", "-movflags", "+faststart",
             output_path,
@@ -268,6 +291,7 @@ def _run_job(job, vae, unet, pe, audio_processor, whisper, fp, timesteps, device
                 res_frame = cv2.resize(res_frame.astype(np.uint8), (x2 - x1, y2 - y1))
             except Exception:
                 continue
+            res_frame = _match_tone(res_frame, ori[y1:y2, x1:x2])
             if idx not in masks:
                 masks[idx] = _prepare_blend_mask(ori, [x1, y1, x2, y2], fp)
             mask_array, crop_box = masks[idx]

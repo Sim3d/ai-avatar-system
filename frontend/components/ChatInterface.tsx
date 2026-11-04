@@ -203,9 +203,15 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
   const chunkQueueRef = useRef<VideoChunk[]>([])
   const isPlayingRef = useRef(false)
 
-  const videoRef = useRef<HTMLVideoElement>(null)
-  // Hidden video element used to preload the next chunk while the current one plays
-  const preloadVideoRef = useRef<HTMLVideoElement>(null)
+  // Two stacked players. The next chunk loads and starts in the hidden one and
+  // is only raised once it is actually playing, so swapping clips never shows
+  // the empty (black) frame a single <video> displays while a new src loads.
+  const videoARef = useRef<HTMLVideoElement>(null)
+  const videoBRef = useRef<HTMLVideoElement>(null)
+  const activeSlotRef = useRef<0 | 1>(0)
+  // True between play() on the standby player and its first frame; preloading
+  // into the standby player then would replace the clip being started.
+  const switchingRef = useRef(false)
   const mediaRecorderRef = useRef<MediaRecorder | null>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const audioContextRef = useRef<AudioContext | null>(null)
@@ -243,6 +249,27 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
   }, [avatarId])
 
   // ── Chunk queue player ───────────────────────────────────────────────────
+  const getPlayers = useCallback(() => {
+    const active = activeSlotRef.current === 0 ? videoARef.current : videoBRef.current
+    const standby = activeSlotRef.current === 0 ? videoBRef.current : videoARef.current
+    return { active, standby }
+  }, [])
+
+  const preloadUpcoming = useCallback(() => {
+    const upcoming = chunkQueueRef.current[0]
+    const { standby } = getPlayers()
+    if (upcoming && standby && !switchingRef.current && standby.src !== upcoming.url) {
+      standby.src = upcoming.url
+    }
+  }, [getPlayers])
+
+  const clearVideos = useCallback(() => {
+    switchingRef.current = false
+    for (const video of [videoARef.current, videoBRef.current]) {
+      if (video) { video.pause(); video.removeAttribute('src'); video.load() }
+    }
+  }, [])
+
   const playNextChunk = useCallback(() => {
     const next = chunkQueueRef.current.shift()
     if (!next) {
@@ -251,57 +278,74 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
       return
     }
     isPlayingRef.current = true
-    setShowVideo(true)
-    if (videoRef.current) {
-      const video = videoRef.current
-      video.src = next.url
-      // Always START muted — browsers always allow muted autoplay, even
-      // outside a user gesture. Starting unmuted gets silently rejected by
-      // Chrome/Edge once the LLM+TTS+animation pipeline (several seconds) has
-      // eaten the brief post-gesture window that permits unmuted autoplay —
-      // which would needlessly skip this clip via the catch below. Unmuting an
-      // element that's ALREADY playing needs no fresh gesture, so we restore
-      // the user's mute choice right after play() resolves.
-      video.muted = true
-      video.play()
-        .then(() => { video.muted = isMuted })
-        // A rejected play() (decode error, bad clip) must not strand the
-        // queue — skip to the next chunk so playback can't hang on one bad clip.
-        .catch(() => {
-          if (chunkQueueRef.current.length > 0) playNextChunk()
-          else { isPlayingRef.current = false; setShowVideo(false) }
-        })
-    }
-    // Preload the next chunk in queue (if any)
-    const upcoming = chunkQueueRef.current[0]
-    if (upcoming && preloadVideoRef.current) {
-      preloadVideoRef.current.src = upcoming.url
-    }
-  }, [isMuted])
-
-  // Attach ended + error handlers to the video element. The error handler is
-  // critical: a 404 / expired presigned URL / undecodable chunk fires `error`
-  // (not `ended`), so without this the whole reply hangs on one bad chunk.
-  useEffect(() => {
-    const video = videoRef.current
+    const { active: previous, standby: video } = getPlayers()
     if (!video) return
-    const onEnded = () => playNextChunk()
-    const onError = () => {
+    if (video.src !== next.url) video.src = next.url
+    switchingRef.current = true
+    // Always START muted — browsers always allow muted autoplay, even
+    // outside a user gesture. Starting unmuted gets silently rejected by
+    // Chrome/Edge once the LLM+TTS+animation pipeline (several seconds) has
+    // eaten the brief post-gesture window that permits unmuted autoplay —
+    // which would needlessly skip this clip via the catch below. Unmuting an
+    // element that's ALREADY playing needs no fresh gesture, so we restore
+    // the user's mute choice right after play() resolves.
+    video.muted = true
+    video.play()
+      .then(() => {
+        // Raise the new clip only now that it has a frame; until then the
+        // previous clip's last frame stays on screen.
+        switchingRef.current = false
+        activeSlotRef.current = activeSlotRef.current === 0 ? 1 : 0
+        video.style.zIndex = '2'
+        video.muted = isMuted
+        if (previous) {
+          previous.style.zIndex = '1'
+          previous.pause()
+        }
+        setShowVideo(true)
+        preloadUpcoming()
+      })
+      // A rejected play() (decode error, bad clip) must not strand the
+      // queue — skip to the next chunk so playback can't hang on one bad clip.
+      .catch(() => {
+        switchingRef.current = false
+        if (chunkQueueRef.current.length > 0) playNextChunk()
+        else { isPlayingRef.current = false; setShowVideo(false) }
+      })
+  }, [isMuted, getPlayers, preloadUpcoming])
+
+  // Attach ended + error handlers to both players; only the visible one drives
+  // the queue (a failed preload surfaces later as a rejected play()). The
+  // error handler is critical: a 404 / expired presigned URL / undecodable
+  // chunk fires `error` (not `ended`), so without it the reply hangs.
+  useEffect(() => {
+    const players = [videoARef.current, videoBRef.current].filter(
+      (v): v is HTMLVideoElement => v !== null,
+    )
+    const isActive = (e: Event) => e.target === getPlayers().active && !switchingRef.current
+    const onEnded = (e: Event) => { if (isActive(e)) playNextChunk() }
+    const onError = (e: Event) => {
+      if (!isActive(e)) return
       if (chunkQueueRef.current.length > 0) playNextChunk()
       else { isPlayingRef.current = false; setShowVideo(false) }
     }
-    video.addEventListener('ended', onEnded)
-    video.addEventListener('error', onError)
-    return () => {
-      video.removeEventListener('ended', onEnded)
-      video.removeEventListener('error', onError)
+    for (const v of players) {
+      v.addEventListener('ended', onEnded)
+      v.addEventListener('error', onError)
     }
-  }, [playNextChunk])
+    return () => {
+      for (const v of players) {
+        v.removeEventListener('ended', onEnded)
+        v.removeEventListener('error', onError)
+      }
+    }
+  }, [playNextChunk, getPlayers])
 
-  // Sync muted state to video element
+  // Sync muted state to the visible player (the standby one stays muted)
   useEffect(() => {
-    if (videoRef.current) videoRef.current.muted = isMuted
-  }, [isMuted])
+    const { active } = getPlayers()
+    if (active) active.muted = isMuted
+  }, [isMuted, getPlayers])
 
   // Auto-scroll chat
   const scrollToBottom = useCallback(() => {
@@ -464,10 +508,7 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
           playNextChunk()
         } else {
           // Already playing — preload this incoming chunk
-          const upcoming = chunkQueueRef.current[0]
-          if (upcoming && preloadVideoRef.current && preloadVideoRef.current.src !== upcoming.url) {
-            preloadVideoRef.current.src = upcoming.url
-          }
+          preloadUpcoming()
         }
         break
       }
@@ -509,10 +550,7 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
         chunkQueueRef.current = []
         isPlayingRef.current = false
         setShowVideo(false)
-        if (videoRef.current) {
-          videoRef.current.pause()
-          videoRef.current.src = ''
-        }
+        clearVideos()
         setIsProcessing(false)
         setIsTyping(false)
         setStreamingContent('')
@@ -521,7 +559,7 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
       case 'pong':
         break
     }
-  }, [playNextChunk])
+  }, [playNextChunk, preloadUpcoming, clearVideos])
 
   const sendMessage = () => {
     if (!inputText.trim() || !ws || !sessionId) return
@@ -559,10 +597,7 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
     chunkQueueRef.current = []
     isPlayingRef.current = false
     setShowVideo(false)
-    if (videoRef.current) {
-      videoRef.current.pause()
-      videoRef.current.src = ''
-    }
+    clearVideos()
     setIsProcessing(false)
     setIsTyping(false)
     setStreamingContent('')
@@ -780,7 +815,7 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
     chunkQueueRef.current = []
     isPlayingRef.current = false
     setShowVideo(false)
-    if (videoRef.current) videoRef.current.src = ''
+    clearVideos()
   }
 
   const copyMessage = (content: string) => {
@@ -897,14 +932,10 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
       // doesn't leak: a still-playing <video>, an open AudioContext, and a
       // running rAF loop all survive unmount otherwise.
       //
-      // Reading videoRef.current HERE is deliberate. The lint rule wants the
-      // element captured in the effect body instead, but this effect runs
-      // once on mount with an empty dep array — at that point the <video> has
-      // not rendered yet and the ref still holds null, so capturing early
-      // would release nothing. On unmount we want whatever element is live.
-      // eslint-disable-next-line react-hooks/exhaustive-deps
-      const video = videoRef.current
-      if (video) { video.pause(); video.removeAttribute('src'); video.load() }
+      // Reading the player refs HERE (inside clearVideos) is deliberate: this
+      // effect runs once on mount, before the <video>s render, so capturing
+      // them early would release nothing. On unmount we want the live ones.
+      clearVideos()
       if (levelAnimRef.current !== null) cancelAnimationFrame(levelAnimRef.current)
       if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
         audioContextRef.current.close().catch(() => {})
@@ -940,17 +971,25 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
               <IdleAvatar imageUrl={avatarImageUrl} />
             </div>
 
-            {/* ── Video element (mounted always; shown only when playing) ── */}
-            <video
-              ref={videoRef}
-              className="absolute inset-0 w-full h-full object-cover transition-opacity duration-500"
-              style={{ opacity: showVideo ? 1 : 0, zIndex: showVideo ? 5 : 0 }}
-              autoPlay
-              playsInline
-              muted={isMuted}
-            />
-            {/* Hidden preload video — buffers the next chunk while current plays */}
-            <video ref={preloadVideoRef} className="hidden" preload="auto" muted />
+            {/* ── Players (always mounted). Only z-order changes: the idle
+                image cuts away instantly once a clip has a frame, and fades
+                back in over the last frame, so no blank frame is ever shown. ── */}
+            <div className="absolute inset-0" style={{ zIndex: showVideo ? 5 : 0 }}>
+              <video
+                ref={videoARef}
+                className="absolute inset-0 w-full h-full object-cover"
+                playsInline
+                preload="auto"
+                muted
+              />
+              <video
+                ref={videoBRef}
+                className="absolute inset-0 w-full h-full object-cover"
+                playsInline
+                preload="auto"
+                muted
+              />
+            </div>
 
             {/* ── Processing overlay ── */}
             {isProcessing && (
