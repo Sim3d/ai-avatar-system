@@ -1,5 +1,6 @@
 from pathlib import Path
 from typing import List, Literal, Optional, Union
+from urllib.parse import urlsplit
 
 from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings
@@ -8,6 +9,20 @@ from pydantic_settings import BaseSettings
 _ENV_FILE = str(Path(__file__).resolve().parent.parent.parent / ".env")
 
 _WEAK_SECRETS = {"change-this-secret-key", "change-this-jwt-secret", "change-this-jwt-secret-key"}
+
+_LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "[::1]", "::1"}
+
+
+def _is_insecure_remote_origin(origin: str) -> bool:
+    """True for a plain-HTTP origin that is not the developer's own machine.
+
+    A loopback origin can only be reached by a browser on the same host, so
+    allowing it lets a local dev client call the deployed API without
+    weakening what remote sites can do.
+    """
+    if not origin.startswith("http://"):
+        return False
+    return urlsplit(origin).hostname not in _LOOPBACK_HOSTS
 
 
 class Settings(BaseSettings):
@@ -260,8 +275,10 @@ class Settings(BaseSettings):
             problems.append(
                 "CORS_ORIGINS must not contain '*' in production — list your exact origins instead"
             )
-        if any(str(o).startswith("http://") for o in self.CORS_ORIGINS):
-            problems.append("CORS_ORIGINS must use https:// in production")
+        if any(_is_insecure_remote_origin(str(o)) for o in self.CORS_ORIGINS):
+            problems.append(
+                "CORS_ORIGINS must use https:// in production (http:// is only allowed for localhost)"
+            )
         if problems:
             raise ValueError("Unsafe production configuration:\n  - " + "\n  - ".join(problems))
         return self

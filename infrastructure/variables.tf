@@ -122,7 +122,7 @@ variable "secret_key" {
 }
 
 variable "cors_origins" {
-  description = "Production requires https origins; the app refuses http in production."
+  description = "Comma-separated extra CORS origins. Production requires https origins, except http://localhost for local dev clients."
   type        = string
   default     = ""
 }

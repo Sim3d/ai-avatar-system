@@ -376,7 +376,8 @@ locals {
     # CORS: CloudFront (https API proxy) plus any extra origins supplied via
     # var.cors_origins (e.g. the Konekt shell in dev). The ALB frontend calls
     # the API on the same origin, so it does not need a CORS entry; http://
-    # origins are rejected by the backend's production config validation.
+    # origins are rejected by the backend's production config validation,
+    # except loopback (http://localhost:<port>) for local dev clients.
     { name = "CORS_ORIGINS", value = join(",", compact([
       "https://${aws_cloudfront_distribution.media_cdn.domain_name}",
       var.cors_origins,

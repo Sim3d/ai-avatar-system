@@ -179,6 +179,20 @@ _PROD_BASE = dict(
             "plain-HTTP origin in production",
         ),
         (
+            dict(DEBUG=False, AUTH_COOKIE_SECURE=True, CORS_ORIGINS=["http://localhost.evil.com"]),
+            True,
+            "a host merely starting with 'localhost' is not loopback",
+        ),
+        (
+            dict(
+                DEBUG=False,
+                AUTH_COOKIE_SECURE=True,
+                CORS_ORIGINS=["https://x.com", "http://localhost:4300", "http://127.0.0.1:4300"],
+            ),
+            False,
+            "loopback dev clients may use plain HTTP",
+        ),
+        (
             dict(DEBUG=False, AUTH_COOKIE_SECURE=True, CORS_ORIGINS=["*"]),
             True,
             "wildcard CORS in production",
