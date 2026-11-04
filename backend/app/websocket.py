@@ -512,7 +512,7 @@ class ConnectionManager:
                     select(Avatar)
                     .join(SessionModel, SessionModel.avatar_id == Avatar.id)
                     .group_by(Avatar.id)
-                    .order_by(func.max(SessionModel.created_at).desc())
+                    .order_by(func.max(SessionModel.started_at).desc())
                     .limit(limit)
                 )
                 avatars = list(result.scalars().all())

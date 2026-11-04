@@ -125,3 +125,44 @@ async def test_prewarm_recent_avatars_never_raises(monkeypatch):
 
     monkeypatch.setattr(database, "AsyncSessionLocal", lambda: _Broken())
     await m.prewarm_recent_avatars()
+
+
+@pytest.mark.asyncio
+async def test_prewarm_recent_avatars_warms_from_real_query(
+    monkeypatch, test_engine, db_session, test_user
+):
+    """Runs the real SQL so a wrong column name fails here, not after a deploy."""
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    import app.database as database
+    from app.models import Avatar
+    from app.models import Session as SessionModel
+
+    avatar = Avatar(
+        user_id=test_user.id, name="a", image_url="/a.jpg", s3_key="avatars/a.jpg", status="ready"
+    )
+    db_session.add(avatar)
+    await db_session.commit()
+    db_session.add(SessionModel(user_id=test_user.id, avatar_id=avatar.id))
+    await db_session.commit()
+
+    monkeypatch.setattr(
+        database,
+        "AsyncSessionLocal",
+        async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False),
+    )
+    m = ConnectionManager()
+    warmed = []
+
+    async def fake_resolve(av):
+        return f"/tmp/{av.id}.jpg"
+
+    async def fake_warm(path):
+        warmed.append(path)
+
+    monkeypatch.setattr(m, "_resolve_local_image", fake_resolve)
+    monkeypatch.setattr(ws_module.avatar_animator, "warm_avatar", fake_warm)
+
+    await m.prewarm_recent_avatars()
+
+    assert warmed == [f"/tmp/{avatar.id}.jpg"]
