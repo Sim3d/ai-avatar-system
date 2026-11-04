@@ -89,14 +89,26 @@ _KEEP_SYMBOLS = set("°©®™")
 # Emoji glue: zero-width joiner, variation selectors, keycap combiner.
 _EMOJI_JOINERS = {"\u200d", "\ufe0e", "\ufe0f", "\u20e3"}
 _WHITESPACE_RUN = re.compile(r"[ \t]{2,}")
+# Markdown the LLM sometimes emits ("**PIM**"): engines read "asterisk".
+_MD_LINK = re.compile(r"\[([^\]]+)\]\([^)]*\)")
+_MD_LINE_PREFIX = re.compile(r"^[ \t]*(?:#{1,6}|>|[-*+])[ \t]+", re.MULTILINE)
+_MD_MARKS = re.compile(r"\*+|`+|~~|(?<!\w)_+|_+(?!\w)")
+
+
+def _strip_markdown(text: str) -> str:
+    text = _MD_LINK.sub(r"\1", text)
+    text = _MD_LINE_PREFIX.sub("", text)
+    return _MD_MARKS.sub("", text)
 
 
 def speakable_text(text: str) -> str:
-    """Drop emoji and pictographs so TTS engines don't read them by name.
+    """Drop emoji, pictographs and Markdown marks so TTS engines don't read them.
 
-    Edge TTS speaks "😊" as "smiling face with smiling eyes". The chat
-    transcript keeps the emoji; only the audio path is cleaned.
+    Edge TTS speaks "😊" as "smiling face with smiling eyes" and Chatterbox
+    reads "**" as "asterisk". The chat transcript keeps the original text;
+    only the audio path is cleaned.
     """
+    text = _strip_markdown(text)
     cleaned = "".join(
         ch
         for ch in text

@@ -94,6 +94,14 @@ def test_speakable_text_drops_emoji_but_keeps_words():
     assert speakable_text("🎉🎉") == ""
 
 
+def test_speakable_text_drops_markdown_marks():
+    assert speakable_text("Open **PIM** in *BIMTrack*.") == "Open PIM in BIMTrack."
+    assert speakable_text("## Steps\n- Click `Save`\n> Note") == "Steps\nClick Save\nNote"
+    assert speakable_text("See [the docs](https://x.io) and __this__.") == "See the docs and this."
+    assert speakable_text("Use snake_case names.") == "Use snake_case names."
+    assert speakable_text("Total is 5 - 3.") == "Total is 5 - 3."
+
+
 async def test_tts_never_sends_emoji_to_engine(monkeypatch, tmp_path):
     service = TTSService()
     out = str(tmp_path / "out.wav")
