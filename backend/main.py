@@ -48,6 +48,11 @@ if settings.SENTRY_DSN:
         logger.warning(f"Failed to initialize Sentry: {e}")
 
 
+async def _prewarm_animation() -> None:
+    await avatar_animator.prewarm()
+    await websocket_manager.prewarm_recent_avatars()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Starting AI Avatar System...")
@@ -91,7 +96,7 @@ async def lifespan(app: FastAPI):
 
     websocket_manager.start_cleanup_task()
     # Background: the first turn after a deploy must not pay model loading.
-    prewarm_task = asyncio.create_task(avatar_animator.prewarm())
+    prewarm_task = asyncio.create_task(_prewarm_animation())
     verify_prewarm_task = asyncio.create_task(tts_verify.prewarm())
     logger.info("AI Avatar System started successfully")
 

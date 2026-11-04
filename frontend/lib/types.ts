@@ -43,7 +43,7 @@ export type WsMessageType =
   | 'pong'
   | 'tts_fallback'
   | 'interrupted'
-
+  | 'warmup'
 // Discriminated union — each WS event has a well-typed payload so the handler
 // can rely on field presence without optional-chaining everywhere.
 export type WsMessage =
@@ -58,6 +58,7 @@ export type WsMessage =
   | { type: 'pong' }
   | { type: 'tts_fallback'; engine: string; voice_cloned: boolean; message: string }
   | { type: 'interrupted'; message: string }
+  | { type: 'warmup'; status: 'start' | 'done' }
 
 export interface VoiceApiResponse {
   id: string

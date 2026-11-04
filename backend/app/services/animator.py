@@ -47,6 +47,7 @@ class AvatarAnimator:
         self._worker_env: dict = {}
         self._worker_stderr_path: Optional[Path] = None
         self._warmed_avatars: set[str] = set()
+        self._warming: dict[str, asyncio.Task] = {}
 
         if self.device == "cuda":
             gpu_name = torch.cuda.get_device_name(0)
@@ -215,11 +216,23 @@ class AvatarAnimator:
 
         The first clip of an avatar pays face detection and first-call CUDA
         costs (~19s on the A10G); doing it at session connect keeps that off
-        the first reply. Never raises.
+        the first reply. Never raises. Concurrent callers for the same avatar
+        (boot prewarm + a session connect) share one warm-up.
         """
         key = str(Path(avatar_path).resolve())
         if key in self._warmed_avatars:
             return
+        task = self._warming.get(key)
+        if task is None:
+            task = asyncio.create_task(self._warm_avatar_once(avatar_path, key))
+            self._warming[key] = task
+            task.add_done_callback(lambda _: self._warming.pop(key, None))
+        await asyncio.shield(task)
+
+    def is_avatar_warm(self, avatar_path: str) -> bool:
+        return str(Path(avatar_path).resolve()) in self._warmed_avatars
+
+    async def _warm_avatar_once(self, avatar_path: str, key: str) -> None:
         try:
             if not self._initialised:
                 await self.initialize()

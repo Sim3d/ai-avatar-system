@@ -160,6 +160,11 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
   const [sessionId, setSessionId] = useState<string | null>(null)
   const [ws, setWs] = useState<WebSocket | null>(null)
   const [isProcessing, setIsProcessing] = useState(false)
+  // True while the backend preloads this avatar's face + voice on the GPU.
+  // A turn sent meanwhile would queue behind the warm-up, so input is locked.
+  const [isWarmingUp, setIsWarmingUp] = useState(false)
+  const isWarmingUpRef = useRef(false)
+  const warmupTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const [isMuted, setIsMuted] = useState(false)
   const [statusMsg, setStatusMsg] = useState('Almost ready…')
   const [isTyping, setIsTyping] = useState(false)
@@ -539,6 +544,21 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
         if (!isPlayingRef.current) setIsProcessing(false)
         break
 
+      case 'warmup': {
+        const warming = data.status === 'start'
+        isWarmingUpRef.current = warming
+        setIsWarmingUp(warming)
+        if (warmupTimerRef.current) clearTimeout(warmupTimerRef.current)
+        // Safety net: never leave the input locked if "done" is lost.
+        if (warming) {
+          warmupTimerRef.current = setTimeout(() => {
+            isWarmingUpRef.current = false
+            setIsWarmingUp(false)
+          }, 60_000)
+        }
+        break
+      }
+
       case 'status':
         // The backend sends an "Animating…" status before EVERY sentence
         // chunk, not just the first. Once a chunk has already started playing,
@@ -583,7 +603,7 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
   }, [playNextChunk, preloadUpcoming, clearVideos])
 
   const sendMessage = () => {
-    if (!inputText.trim() || !ws || !sessionId) return
+    if (!inputText.trim() || !ws || !sessionId || isWarmingUpRef.current) return
     if (ws.readyState !== WebSocket.OPEN) {
       // send() on a CONNECTING socket throws; on CLOSED it silently drops.
       toast.error('Not connected to the avatar yet — try again in a moment.')
@@ -651,6 +671,7 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
    * hands-free so the two cannot drift on what "sending a turn" means.
    */
   const sendAudioBlob = (audioBlob: Blob) => {
+    if (isWarmingUpRef.current) return
     const reader = new FileReader()
     reader.onloadend = () => {
       const base64Audio = (reader.result as string).split(',')[1]
@@ -939,6 +960,7 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
     return () => {
       // Cancel any pending reconnect
       if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current)
+      if (warmupTimerRef.current) clearTimeout(warmupTimerRef.current)
       // Read the session id BEFORE nulling the ref (which stops the
       // reconnect loop). Don't use the `sessionId`/`ws` state here: this
       // cleanup closes over the first render where both were still null,
@@ -1023,6 +1045,18 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
                   <Wand2 className="absolute inset-0 m-auto text-primary-400" size={20} />
                 </div>
                 <p className="text-sm text-gray-700 font-medium animate-pulse">{statusMsg}</p>
+              </div>
+            )}
+
+            {/* ── Warm-up badge ── */}
+            {isWarmingUp && !isProcessing && (
+              <div
+                role="status"
+                className="absolute left-1/2 -translate-x-1/2 bottom-3 z-30 flex items-center gap-2 rounded-full
+ border border-white/15 bg-ink/70 px-3 py-1.5 backdrop-blur-sm"
+              >
+                <Loader2 size={14} className="animate-spin text-primary-400" />
+                <span className="text-xs text-gray-25">Warming up avatar…</span>
               </div>
             )}
 
@@ -1340,7 +1374,7 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
           <div className="flex gap-2 items-end">
             <button
               onClick={isRecording ? stopRecording : startRecording}
-              disabled={isProcessing || handsFree}
+              disabled={isProcessing || handsFree || isWarmingUp}
               aria-label={isRecording ? 'Stop recording' : 'Start voice recording'}
               aria-pressed={isRecording}
               title={handsFree ? 'Hands-free is listening — turns are detected automatically' : undefined}
@@ -1350,7 +1384,7 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
  ? 'bg-error-600 hover:bg-error-500 text-gray-900 shadow-[0_0_20px_rgba(239,68,68,0.5)]'
  : 'bg-gray-100 hover:bg-gray-200 border border-gray-200 hover:border-primary-500/40 text-gray-500 hover:text-gray-900'
  }
- ${isProcessing || handsFree ? 'opacity-40 cursor-not-allowed' : ''}`}
+ ${isProcessing || handsFree || isWarmingUp ? 'opacity-40 cursor-not-allowed' : ''}`}
             >
               {isRecording ? <MicOff size={18} /> : <Mic size={18} />}
               {isRecording && (
@@ -1383,9 +1417,13 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
                 onKeyDown={(e) => {
                   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage() }
                 }}
-                placeholder={isRecording ? 'Recording…' : 'Message your avatar… (Enter to send)'}
+                placeholder={
+                  isWarmingUp ? 'Warming up the avatar…'
+                    : isRecording ? 'Recording…'
+                    : 'Message your avatar… (Enter to send)'
+                }
                 aria-label="Message your avatar"
-                disabled={isProcessing || isRecording}
+                disabled={isProcessing || isRecording || isWarmingUp}
                 rows={1}
                 className="w-full px-4 py-2.5 rounded-xl bg-gray-100 border border-gray-200 text-gray-900 text-sm
  placeholder:text-gray-500 focus:outline-none focus:ring-2 focus:ring-primary-500/50
@@ -1408,7 +1446,7 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
             ) : (
               <button
                 onClick={sendMessage}
-                disabled={!inputText.trim() || isRecording}
+                disabled={!inputText.trim() || isRecording || isWarmingUp}
                 aria-label="Send message"
                 className="flex-shrink-0 w-10 h-10 rounded-xl 
  flex items-center justify-center text-gray-900 hover:shadow-sm

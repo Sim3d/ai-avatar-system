@@ -247,14 +247,24 @@ class ConnectionManager:
         """
         data = self.session_data[session_id]
         image, wav = data.get("avatar_image_local"), data.get("voice_wav")
+        if image and avatar_animator.is_avatar_warm(image):
+            image = None
+        if wav and tts_service.is_voice_warm(wav):
+            wav = None
         if not image and not wav:
             return
 
         async def _warm() -> None:
-            await asyncio.gather(
-                avatar_animator.warm_avatar(image) if image else asyncio.sleep(0),
-                tts_service.warm_voice(wav) if wav else asyncio.sleep(0),
-            )
+            # The client locks its input until "done": a turn sent mid-warm-up
+            # queues behind it on the GPU and feels like a ~20s voice delay.
+            await self.send_message(session_id, {"type": "warmup", "status": "start"})
+            try:
+                await asyncio.gather(
+                    avatar_animator.warm_avatar(image) if image else asyncio.sleep(0),
+                    tts_service.warm_voice(wav) if wav else asyncio.sleep(0),
+                )
+            finally:
+                await self.send_message(session_id, {"type": "warmup", "status": "done"})
 
         task = asyncio.create_task(_warm(), name=f"warm-{session_id}")
         self._warm_tasks.add(task)
@@ -481,6 +491,42 @@ class ConnectionManager:
         except Exception as e:
             logger.warning(f"Could not read voice index: {e}")
         return None
+
+    async def prewarm_recent_avatars(self, limit: int = 10) -> None:
+        """
+        Warm the most recently used avatars right after boot.
+
+        The first clip after a worker start pays ~14s of one-time init plus
+        ~6s face detection per avatar; without this, every deploy made the
+        user's first reply wait ~25s. Never raises.
+        """
+        try:
+            from sqlalchemy import func, select
+
+            from app.database import AsyncSessionLocal
+            from app.models import Avatar
+            from app.models import Session as SessionModel
+
+            async with AsyncSessionLocal() as db:
+                result = await db.execute(
+                    select(Avatar)
+                    .join(SessionModel, SessionModel.avatar_id == Avatar.id)
+                    .group_by(Avatar.id)
+                    .order_by(func.max(SessionModel.created_at).desc())
+                    .limit(limit)
+                )
+                avatars = list(result.scalars().all())
+            for avatar in avatars:
+                try:
+                    image = await self._resolve_local_image(avatar)
+                except Exception as e:
+                    logger.warning(f"Avatar prewarm skipped for {avatar.id}: {e}")
+                    continue
+                await avatar_animator.warm_avatar(image)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"Avatar prewarm failed: {e}")
 
     async def _resolve_local_image(self, avatar) -> str:
         """Return a local FS path to the avatar image, downloading from S3 if needed."""

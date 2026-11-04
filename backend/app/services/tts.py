@@ -126,6 +126,10 @@ class TTSService:
         self.model = None
         self._load_error: Optional[Exception] = None
         self._init_lock = asyncio.Lock()
+        self._warmed_voices: set[str] = set()
+
+    def is_voice_warm(self, speaker_wav: str) -> bool:
+        return not settings.CHATTERBOX_URL or speaker_wav in self._warmed_voices
 
     def _check_cuda(self) -> bool:
         try:
@@ -299,10 +303,13 @@ class TTSService:
         """
         if not settings.CHATTERBOX_URL or not Path(speaker_wav).exists():
             return
+        if speaker_wav in self._warmed_voices:
+            return
         fd, out = tempfile.mkstemp(suffix="_warm.wav")
         os.close(fd)
         try:
             await self._remote_chatterbox("Hi.", out, speaker_wav, "en")
+            self._warmed_voices.add(speaker_wav)
         except Exception as e:
             logger.warning(f"Voice warm-up failed (first sentence will be slower): {e}")
         finally:
