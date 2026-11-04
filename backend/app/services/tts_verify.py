@@ -71,8 +71,8 @@ def _get_model():
     return _model
 
 
-def _transcribe(path: str, language: str) -> tuple[str, Optional[float]]:
-    """Return the transcript and the end time (s) of its last word."""
+def _transcribe(path: str, language: str) -> tuple[str, list[tuple[str, float]]]:
+    """Return the transcript and its (word, end time in s) pairs."""
     segments, _ = _get_model().transcribe(
         path,
         language=language,
@@ -82,12 +82,30 @@ def _transcribe(path: str, language: str) -> tuple[str, Optional[float]]:
     )
     segments = list(segments)
     words = [w for s in segments for w in (s.words or [])]
-    return " ".join(s.text for s in segments), (words[-1].end if words else None)
+    return " ".join(s.text for s in segments), [(w.word, w.end) for w in words]
 
 
-def ends_with_expected_word(expected: str, heard: str) -> bool:
-    exp, got = _words(expected), _words(heard)
-    return bool(exp and got and exp[-1] == got[-1])
+def expected_end(expected: str, heard_words: list[tuple[str, float]]) -> Optional[float]:
+    """End time of the sentence's last word as heard, or None if not trustworthy.
+
+    Whisper may transcribe a clipped trailing repeat as a junk word
+    ("today? Towinged."), so anchor on the last occurrence of the expected
+    final word rather than on the last heard word. The anchor must sit near
+    the end of the sentence so a misheard earlier occurrence never cuts real
+    speech.
+    """
+    exp = _words(expected)
+    if not exp:
+        return None
+    index, anchor = -1, None
+    for word, end in heard_words:
+        for token in _words(word):
+            index += 1
+            if token == exp[-1]:
+                anchor = (index, end)
+    if anchor is None or anchor[0] + 1 < len(exp) - 1:
+        return None
+    return anchor[1]
 
 
 def trailing_speech_start(
@@ -134,13 +152,14 @@ def trim_trailing_babble(path: str, last_word_end: float) -> bool:
 
 
 def _verify(path: str, text: str, language: str) -> bool:
-    heard, last_end = _transcribe(path, language)
+    heard, heard_words = _transcribe(path, language)
     if has_extra_repetition(text, heard):
         logger.warning(f"TTS repetition detected: expected {text!r}, heard {heard!r}")
         return True
     # Only trust Whisper's timing when it heard the sentence through to its
     # last word; otherwise the "tail" may be real speech it misheard.
-    if last_end is not None and ends_with_expected_word(text, heard):
+    last_end = expected_end(text, heard_words)
+    if last_end is not None:
         if trim_trailing_babble(path, last_end):
             logger.warning(f"TTS trailing babble trimmed after {last_end:.2f}s: {text!r}")
     return False

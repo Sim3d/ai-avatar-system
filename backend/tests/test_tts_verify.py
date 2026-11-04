@@ -79,14 +79,18 @@ def _write(path, samples):
     sf.write(str(path), samples, SR)
 
 
+def _heard(text, last_end):
+    """Fake `_transcribe` output whose last word ends at `last_end`."""
+    words = text.split()
+    return lambda *_: (text, [(w, last_end - 0.1 * (len(words) - 1 - i)) for i, w in enumerate(words)])
+
+
 def test_clipped_repeat_after_last_word_is_trimmed(monkeypatch, tmp_path):
     sf = pytest.importorskip("soundfile")
     # Pattern of a real clip: "...today?" ends at 1.3s, silence, then a clipped "today".
     out = tmp_path / "out.wav"
     _write(out, _clip((1.3, 0.2), (0.6, 0.0), (0.3, 0.2)))
-    monkeypatch.setattr(
-        tts_verify, "_transcribe", lambda *_: (" How are you doing today?", 1.3)
-    )
+    monkeypatch.setattr(tts_verify, "_transcribe", _heard(" How are you doing today?", 1.3))
 
     assert tts_verify._verify(str(out), "How are you doing today?", "en") is False
 
@@ -94,11 +98,27 @@ def test_clipped_repeat_after_last_word_is_trimmed(monkeypatch, tmp_path):
     assert len(trimmed) / SR == pytest.approx(1.45, abs=0.01)
 
 
+def test_clipped_repeat_heard_as_junk_word_is_trimmed(monkeypatch, tmp_path):
+    sf = pytest.importorskip("soundfile")
+    # Whisper heard the clipped repeat as "Towinged." after "today?".
+    out = tmp_path / "out.wav"
+    _write(out, _clip((1.3, 0.2), (0.4, 0.0), (0.5, 0.2)))
+    words = [(" How", 0.5), (" are", 0.7), (" you", 0.9), (" doing", 1.1), (" today?", 1.3),
+             (" Towinged.", 2.1)]
+    monkeypatch.setattr(
+        tts_verify, "_transcribe", lambda *_: (" How are you doing today? Towinged.", words)
+    )
+
+    tts_verify._verify(str(out), "How are you doing today?", "en")
+
+    assert len(sf.read(str(out))[0]) / SR == pytest.approx(1.45, abs=0.01)
+
+
 def test_clean_clip_is_not_trimmed(monkeypatch, tmp_path):
     sf = pytest.importorskip("soundfile")
     out = tmp_path / "out.wav"
     _write(out, _clip((1.3, 0.2), (0.8, 0.0)))
-    monkeypatch.setattr(tts_verify, "_transcribe", lambda *_: (" Hi there.", 1.3))
+    monkeypatch.setattr(tts_verify, "_transcribe", _heard(" Hi there.", 1.3))
 
     tts_verify._verify(str(out), "Hi there.", "en")
 
@@ -109,8 +129,14 @@ def test_tail_is_kept_when_whisper_missed_the_last_word(monkeypatch, tmp_path):
     sf = pytest.importorskip("soundfile")
     out = tmp_path / "out.wav"
     _write(out, _clip((1.0, 0.2), (0.4, 0.0), (0.5, 0.2)))
-    monkeypatch.setattr(tts_verify, "_transcribe", lambda *_: (" Hi there, great", 1.0))
+    monkeypatch.setattr(tts_verify, "_transcribe", _heard(" Hi there, great", 1.0))
 
     tts_verify._verify(str(out), "Hi there, great to meet you.", "en")
 
     assert len(sf.read(str(out))[0]) == int(1.9 * SR)
+
+
+def test_early_occurrence_of_last_word_is_not_an_anchor():
+    # "you" heard only at position 2 of a 6-word sentence: not the sentence end.
+    heard = [(" Hi", 0.2), (" you", 0.5), (" there", 0.8)]
+    assert tts_verify.expected_end("Great to meet you, see you", heard) is None
